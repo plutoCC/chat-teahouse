@@ -1,0 +1,76 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, realpathSync, lstatSync } from 'node:fs';
+import { resolve, join, dirname, basename } from 'node:path';
+import { createServer } from 'node:net';
+import { chromium } from 'playwright-core';
+import { buildApp } from '../../server/app.js';
+import { fixtureModelCatalog } from './model-list-fixture.js';
+
+test('RMB price hints cover every provider, calculate quantities, preserve USD and add a Doubao member', { timeout: 90000 }, async t => {
+  const root = resolve('.test-artifacts'); mkdirSync(root, { recursive: true }); const dataDir = mkdtempSync(join(root, 'pricing-ui-'));
+  const port = await new Promise<number>((done, reject) => { const s = createServer(); s.once('error', reject); s.listen(0, '127.0.0.1', () => { const n = (s.address() as { port: number }).port; s.close(() => done(n)); }); });
+  const runtime = await buildApp({ dataDir, port, production: true, modelCatalogFetcher: fixtureModelCatalog });
+  const host = `127.0.0.1:${port}`, url = `http://${host}`;
+  const boot = (await runtime.app.inject({ url: '/api/bootstrap', headers: { host } })).json();
+  const headers = { host, origin: url, 'x-csrf-token': boot.csrfToken };
+  assert.equal((await runtime.app.inject({ method: 'PUT', url: '/api/providers/openai', headers, payload: { model: 'gpt-6.1-sol', inputPrice: 2, outputPrice: 10 } })).statusCode, 200);
+  await runtime.app.listen({ host: '127.0.0.1', port });
+  const browser = await chromium.launch({ channel: process.env.CHAT_TEA_BROWSER_CHANNEL ?? 'msedge', headless: true, chromiumSandbox: true });
+  t.after(async () => { await browser.close(); await runtime.app.close(); assert.equal(lstatSync(dataDir).isSymbolicLink(), false); const target = realpathSync(dataDir); assert.equal(dirname(target), realpathSync(root)); assert.ok(basename(target).startsWith('pricing-ui-')); rmSync(target, { recursive: true, force: true }); });
+  const page = await browser.newPage({ viewport: { width: 1365, height: 980 } }); const errors: string[] = [];
+  page.setDefaultTimeout(10000); page.on('pageerror', e => errors.push(e.message));
+  await page.route('**/*', route => route.request().url().startsWith(url) ? route.continue() : route.abort());
+  await page.goto(url); await page.getByRole('button', { name: '模型连接', exact: true }).click();
+  assert.equal(await page.getByLabel('输入单价', { exact: true }).inputValue(), '14');
+  const inputHint = page.getByRole('button', { name: '输入参考价格说明', exact: true });
+  await inputHint.hover(); await page.getByRole('tooltip').waitFor(); assert.match(await page.getByRole('tooltip').innerText(), /¥14.00/);
+  await inputHint.focus(); await page.keyboard.press('Escape'); assert.equal(await page.getByRole('tooltip').count(), 0); assert.equal(await page.getByRole('dialog').isVisible(), true);
+  await page.getByLabel('输入用量（百万 Token）', { exact: true }).fill('2'); await page.getByLabel('输出用量（百万 Token）', { exact: true }).fill('0.5');
+  assert.match(await page.getByLabel('人民币试算结果', { exact: true }).innerText(), /合计约 ¥63.00/);
+  await page.getByText('估算汇率：1 美元 ≈ 7 元（可修改）', { exact: true }).click();
+  await page.getByLabel('人民币 / 美元（非实时）', { exact: true }).fill('7.2'); await page.getByLabel('输入单价', { exact: true }).focus();
+  assert.equal(await page.getByLabel('输入单价', { exact: true }).inputValue(), '14.4');
+  await page.getByRole('button', { name: '保存连接', exact: true }).click(); await page.getByText('连接配置已保存', { exact: true }).waitFor();
+  assert.equal(runtime.store.providers().find(p => p.id === 'openai')!.inputPrice, 2); assert.equal(runtime.store.providers().find(p => p.id === 'openai')!.outputPrice, 10);
+  await page.reload(); await page.getByRole('button', { name: '模型连接', exact: true }).click();
+  assert.equal(await page.getByLabel('输入单价', { exact: true }).inputValue(), '14.4');
+  const nav = page.getByRole('navigation', { name: '模型供应商' });
+  for (const name of ['本地演示', 'Claude', 'DeepSeek', '通义千问', 'Ollama', '豆包']) {
+    await nav.getByRole('button', { name: new RegExp(name) }).click();
+    await page.getByRole('button', { name: '输出参考价格说明', exact: true }).hover();
+    await page.getByRole('tooltip').waitFor(); assert.match(await page.getByRole('tooltip').innerText(), /百万 Token/);
+    await page.getByRole('heading', { name, exact: true }).hover();
+  }
+  // Doubao's CNY quote must not get multiplied by the USD exchange rate.
+  assert.match(await page.getByLabel('人民币试算结果', { exact: true }).innerText(), /合计约 ¥3.50/);
+  await page.getByRole('button', { name: '采用此参考单价', exact: true }).click();
+  assert.equal(await page.getByLabel('输入单价', { exact: true }).inputValue(), '0.8');
+  await page.getByLabel('API Key', { exact: false }).fill('fixture-key-not-real');
+  await page.getByRole('button', { name: '保存连接', exact: true }).click(); await page.getByText('连接配置已保存', { exact: true }).waitFor();
+  assert.ok(Math.abs(runtime.store.providers().find(p => p.id === 'doubao')!.inputPrice - 0.8 / 7.2) < 1e-12);
+  await page.getByRole('checkbox', { name: '启用此连接', exact: true }).click(); await page.getByText('连接已启用并保存', { exact: true }).waitFor();
+  // Unknown endpoints have no fabricated quote, but custom prices still support the calculator.
+  await page.getByRole('checkbox', { name: '高级：手动填写模型 ID', exact: true }).check();
+  await page.getByLabel('自定义模型 ID', { exact: true }).fill('ep-custom-test');
+  await page.getByRole('button', { name: '输入参考价格说明', exact: true }).hover(); assert.match(await page.getByRole('tooltip').innerText(), /暂无此模型/);
+  assert.equal(await page.getByRole('button', { name: '采用此参考单价', exact: true }).count(), 0);
+  await page.getByRole('button', { name: '关闭对话框', exact: true }).click();
+  await page.getByRole('button', { name: '成员与设置', exact: true }).click();
+  await page.getByRole('button', { name: '邀请一位 AI 入座', exact: true }).click();
+  await page.getByRole('button', { name: '创建新成员', exact: true }).click();
+  await page.getByLabel('显示名称', { exact: true }).fill('豆包测试成员'); await page.getByRole('combobox', { name: '模型供应商', exact: true }).selectOption('doubao');
+  await page.getByRole('button', { name: '保存成员', exact: true }).click(); await page.getByRole('dialog').waitFor({ state: 'hidden' });
+  assert.equal(runtime.store.groups()[0].participants.at(-1)!.providerId, 'doubao');
+  assert.equal(runtime.store.groups()[0].participants.at(-1)!.model, 'doubao-seed-2-1-lite-260915');
+  await page.getByRole('button', { name: '关闭侧栏', exact: true }).click();
+  await page.getByRole('button', { name: '模型连接', exact: true }).click(); await nav.getByRole('button', { name: /豆包/ }).click();
+  await page.getByRole('button', { name: '输入参考价格说明', exact: true }).hover();
+  mkdirSync(resolve('output/playwright'), { recursive: true }); await page.screenshot({ path: resolve('output/playwright/pricing-doubao-desktop.png') });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.getByRole('button', { name: '输出参考价格说明', exact: true }).click(); await page.getByRole('tooltip').waitFor();
+  const box = await page.getByRole('tooltip').boundingBox(); assert.ok(box && box.x >= 0 && box.x + box.width <= 390);
+  assert.ok(box.y >= 0 && box.y + box.height <= 844, 'tooltip should remain fully inside the phone viewport');
+  assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+  await page.screenshot({ path: resolve('output/playwright/pricing-doubao-mobile.png') }); assert.deepEqual(errors, []);
+});

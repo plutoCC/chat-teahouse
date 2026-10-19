@@ -1,0 +1,37 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, realpathSync, lstatSync } from 'node:fs';
+import { resolve, join, dirname, basename } from 'node:path';
+import { createServer } from 'node:net';
+import { chromium } from 'playwright-core';
+import { buildApp } from '../../server/app.js';
+import { fixtureModelCatalog } from './model-list-fixture.js';
+
+test('page recovers from terminal SSE errors and server restarts without losing draft or using an old CSRF token', {timeout:45000}, async t=>{
+  const root=resolve('.test-artifacts');mkdirSync(root,{recursive:true});const dataDir=mkdtempSync(join(root,'reconnect-ui-'));
+  const port=await new Promise<number>((done,reject)=>{const s=createServer();s.once('error',reject);s.listen(0,'127.0.0.1',()=>{const n=(s.address() as {port:number}).port;s.close(()=>done(n));});});
+  const url=`http://127.0.0.1:${port}`,host=`127.0.0.1:${port}`;
+  let runtime=await buildApp({dataDir,port,production:true,modelCatalogFetcher:fixtureModelCatalog});await runtime.app.listen({host:'127.0.0.1',port});
+  const browser=await chromium.launch({channel:process.env.CHAT_TEA_BROWSER_CHANNEL??'msedge',headless:true,chromiumSandbox:true});
+  t.after(async()=>{await browser.close();await runtime.app.close();assert.equal(lstatSync(dataDir).isSymbolicLink(),false);const target=realpathSync(dataDir);assert.equal(dirname(target),realpathSync(root));assert.ok(basename(target).startsWith('reconnect-ui-'));rmSync(target,{recursive:true,force:true});});
+  const page=await browser.newPage({viewport:{width:1365,height:900}});const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+  let streams=0;
+  await page.route('**/api/events',async route=>{streams++;if(streams===1)await route.fulfill({status:503,contentType:'text/plain',body:'temporary outage'});else await route.continue();});
+  await page.goto(url);await page.getByText('连接中断，正在自动重连',{exact:true}).waitFor();
+  await page.getByText('连接中断，正在自动重连',{exact:true}).waitFor({state:'hidden'});assert.ok(streams>=2,'terminally closed EventSource was recreated');
+  const draft='【恢复验收】后台停止期间也不能丢失的未发送草稿。';await page.getByRole('textbox',{name:'输入讨论问题',exact:true}).fill(draft);
+  const boot=(await runtime.app.inject({url:'/api/bootstrap',headers:{host}})).json();
+  assert.equal((await runtime.app.inject({method:'POST',url:'/api/service/stop',headers:{host},payload:{}})).statusCode,403);
+  assert.equal((await runtime.app.inject({method:'POST',url:'/api/service/stop',headers:{host,origin:'https://foreign.example','x-csrf-token':boot.csrfToken},payload:{}})).statusCode,403);
+  const headers={host,origin:url,'x-csrf-token':boot.csrfToken};
+  assert.equal((await runtime.app.inject({method:'POST',url:'/api/service/stop',headers,payload:{command:'forbidden'}})).statusCode,400);
+  const stop=await fetch(url+'/api/service/stop',{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:'{}'});assert.equal(stop.status,200);assert.equal((await stop.json() as {ok:boolean}).ok,true);
+  await runtime.app.close();await page.getByText('连接中断，正在自动重连',{exact:true}).waitFor();assert.equal(await page.getByRole('textbox',{name:'输入讨论问题',exact:true}).inputValue(),draft);
+  mkdirSync(resolve('output/playwright'),{recursive:true});await page.screenshot({path:resolve('output/playwright/connection-interrupted.png')});
+  runtime=await buildApp({dataDir,port,production:true,modelCatalogFetcher:fixtureModelCatalog});await runtime.app.listen({host:'127.0.0.1',port});
+  await page.getByText('连接中断，正在自动重连',{exact:true}).waitFor({state:'hidden'});assert.equal(await page.getByRole('textbox',{name:'输入讨论问题',exact:true}).inputValue(),draft);
+  await page.getByRole('button',{name:'发送',exact:true}).click();await page.getByText(draft,{exact:true}).waitFor();
+  assert.equal(await page.getByRole('textbox',{name:'输入讨论问题',exact:true}).inputValue(),'');assert.equal(await page.locator('.error-banner').count(),0);
+  assert.equal(runtime.store.messages(boot.groups[0].id).filter(m=>m.content===draft).length,1);
+  await page.screenshot({path:resolve('output/playwright/connection-restored.png')});assert.deepEqual(errors,[]);
+});

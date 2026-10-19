@@ -1,0 +1,45 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdirSync,mkdtempSync,rmSync,realpathSync,lstatSync} from 'node:fs';
+import {resolve,join,dirname,basename} from 'node:path';
+import {createServer} from 'node:net';
+import {chromium} from 'playwright-core';
+import {ToolCallId} from '@deepseek-ai/dsh-llm';
+import {buildApp} from '../../server/app.js';
+import {defaultFreeSettings} from '../../shared/free-chat.js';
+
+test('queued countdown changes back to thinking after a rejected delivery, then publishes the revised reply', {timeout:60000},async t=>{
+  const root=resolve('.test-artifacts');mkdirSync(root,{recursive:true});const dataDir=mkdtempSync(join(root,'publication-ui-'));
+  const port=await new Promise<number>((done,reject)=>{const s=createServer();s.once('error',reject);s.listen(0,'127.0.0.1',()=>{const n=(s.address() as {port:number}).port;s.close(()=>done(n));});});
+  let calls=0,release:()=>void=()=>{};
+  const runtime=await buildApp({dataDir,port,production:true,nativeGenerate:async options=>{
+    const call=++calls;
+    if(call<=2)await new Promise<void>((done,reject)=>{release=done;options.signal?.addEventListener('abort',()=>reject(new Error('cancelled')),{once:true});});
+    const name=call===2?'read_messages':'post_message',args=call===2?{}:{content:call===1?'【本地模拟】尚未考虑新条件的草稿':'【本地模拟】我结合新条件修正了判断。\n\n这个结论仍需要数据检验。'};
+    return {blocks:[{type:'tool-call',id:ToolCallId(crypto.randomUUID()),name,arguments:JSON.stringify(args)}],inputTokens:100,outputTokens:30};
+  }});
+  const host=`127.0.0.1:${port}`,boot=(await runtime.app.inject({url:'/api/bootstrap',headers:{host}})).json();
+  const headers={host,origin:`http://${host}`,'x-csrf-token':boot.csrfToken};
+  assert.equal((await runtime.app.inject({method:'PUT',url:'/api/providers/openai',headers,payload:{enabled:true,apiKey:'local-fixture-no-network',modelPrices:{'fixture-queue':{inputPrice:1,outputPrice:1}}}})).statusCode,200);
+  const group=runtime.store.groups()[0];group.name='发言状态 · 本地模拟验收';group.conversationMode='free';
+  group.participants=group.participants.slice(0,1).map(p=>({...p,name:'讨论员（模拟）',providerId:'openai',model:'fixture-queue'}));
+  group.freeSettings={...defaultFreeSettings,messageStyle:'segmented',messageGapMin:1,messageGapMax:1,typingGraceSeconds:0,quietSeconds:0,cooldownMin:300,cooldownMax:300,concurrency:1};group.settings.budgetUSD=0;runtime.store.saveGroup(group);
+  await runtime.app.listen({host:'127.0.0.1',port});
+  const browser=await chromium.launch({channel:process.env.CHAT_TEA_BROWSER_CHANNEL??'msedge',headless:true,chromiumSandbox:true});
+  t.after(async()=>{release();await browser.close();await runtime.app.close();assert.equal(lstatSync(dataDir).isSymbolicLink(),false);const target=realpathSync(dataDir);assert.equal(dirname(target),realpathSync(root));assert.ok(basename(target).startsWith('publication-ui-'));rmSync(target,{recursive:true,force:true});});
+  const page=await browser.newPage({viewport:{width:1365,height:980}}),errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
+  await page.goto(`http://${host}`);await page.getByRole('heading',{name:group.name,exact:true}).waitFor();await page.getByRole('button',{name:'开始讨论',exact:true}).click();
+  const status=page.getByRole('region',{name:'成员实时状态',exact:true});
+  await status.getByText('正在独立思考与生成',{exact:true}).waitFor();
+  assert.equal(calls,1);runtime.store.mutateFree(group.id,s=>{s.nextPublishAt=Date.now()+60000;});release();
+  await status.getByText('排队发送',{exact:true}).waitFor();await status.getByText(/等待阅读 \/ 发送间隔 · 最早 \d+ 秒后发送/).waitFor();
+  mkdirSync(resolve('output/playwright'),{recursive:true});await page.screenshot({path:resolve('output/playwright/publication-queued.png')});
+  const input=page.getByRole('textbox',{name:'输入讨论问题',exact:true});await input.fill('新的讨论条件');await page.getByRole('button',{name:'加入讨论',exact:true}).click();await page.locator('.messages').getByText('新的讨论条件',{exact:true}).waitFor();
+  runtime.store.mutateFree(group.id,s=>{s.nextPublishAt=0;});
+  await status.getByText('正在独立思考与生成',{exact:true}).waitFor();assert.equal(calls,2);assert.equal(await status.getByText('排队发送',{exact:true}).count(),0);assert.equal(await status.getByText(/最早.*秒后发送/).count(),0);
+  await page.setViewportSize({width:390,height:844});await page.waitForFunction(()=>{const p=document.querySelector('.groups-panel');return p?.hasAttribute('inert')&&p.getBoundingClientRect().right<=0;});await status.getByText('正在独立思考与生成',{exact:true}).waitFor();assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.screenshot({path:resolve('output/playwright/publication-thinking-mobile.png')});
+  await page.setViewportSize({width:1365,height:980});await page.getByRole('button',{name:'群聊日志与用量',exact:true}).click();await page.getByRole('dialog').getByText(/发言尚未发送：有新的人类或导入消息尚未读取/).waitFor();await page.getByRole('button',{name:'关闭对话框',exact:true}).click();
+  release();await page.locator('.messages').getByText('这个结论仍需要数据检验。',{exact:true}).waitFor();assert.equal(calls,3);
+  assert.equal(runtime.store.messages(group.id).filter(m=>m.kind==='assistant').length,2);assert.equal(await page.locator('.messages').getByText('【本地模拟】尚未考虑新条件的草稿',{exact:true}).count(),0);
+  await page.getByRole('button',{name:'暂停讨论',exact:true}).click();await page.getByRole('button',{name:'继续讨论',exact:true}).waitFor();assert.deepEqual(errors,[]);
+});

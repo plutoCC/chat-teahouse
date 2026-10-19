@@ -1,0 +1,33 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdirSync,mkdtempSync,rmSync,realpathSync,lstatSync} from 'node:fs';
+import {resolve,join,dirname,basename} from 'node:path';
+import {createServer} from 'node:net';
+import {chromium} from 'playwright-core';
+import {buildApp} from '../../server/app.js';
+import {fixtureModelCatalog} from './model-list-fixture.js';
+import type {SubscriptionService} from '../../server/subscription/codex.js';
+
+test('balance settings, per-model prices and subscription quota render without leaking credentials',{timeout:60000},async t=>{
+  const root=resolve('.test-artifacts');mkdirSync(root,{recursive:true});const dataDir=mkdtempSync(join(root,'billing-ui-'));
+  const port=await new Promise<number>((done,reject)=>{const s=createServer();s.once('error',reject);s.listen(0,'127.0.0.1',()=>{const n=(s.address() as {port:number}).port;s.close(()=>done(n));});});
+  let financialCalls=0;
+  const subscription:SubscriptionService={status:async()=>({connected:true,pending:false,plan:'测试套餐',quotas:[{id:'codex',name:'Codex（模拟）',primary:{usedPercent:20,windowDurationMins:300,resetsAt:Date.now()/1000+600},secondary:null}]}),login:async()=>({url:'https://auth.openai.com/fixture'}),cancel:async()=>{},logout:async()=>{},models:async p=>({...await fixtureModelCatalog(p),models:[{id:'gpt-fixture',label:'gpt-fixture'}]}),generate:async()=>{throw Error('must not infer');},close:async()=>{}};
+  const runtime=await buildApp({dataDir,port,production:true,modelCatalogFetcher:fixtureModelCatalog,subscription,billingFetcher:async url=>{financialCalls++;assert.equal(String(url),'https://api.deepseek.com/user/balance');return Response.json({is_available:true,balance_infos:[{currency:'CNY',total_balance:'123.45',granted_balance:'3.45',topped_up_balance:'120'}]});}});
+  const host=`127.0.0.1:${port}`,boot=(await runtime.app.inject({url:'/api/bootstrap',headers:{host}})).json(),headers={host,origin:`http://${host}`,'x-csrf-token':boot.csrfToken};
+  await runtime.app.inject({method:'PUT',url:'/api/providers/deepseek',headers,payload:{apiKey:'fixture-never-real'}});
+  await runtime.app.inject({method:'PUT',url:'/api/providers/openai',headers,payload:{model:'gpt-6.1-sol',modelPrices:{'gpt-6.1-sol':{inputPrice:1,outputPrice:2},'gpt-6-astra':{inputPrice:3,outputPrice:4}}}});
+  await runtime.app.listen({host:'127.0.0.1',port});const browser=await chromium.launch({channel:process.env.CHAT_TEA_BROWSER_CHANNEL??'msedge',headless:true,chromiumSandbox:true});
+  t.after(async()=>{await browser.close();await runtime.app.close();assert.equal(lstatSync(dataDir).isSymbolicLink(),false);const target=realpathSync(dataDir);assert.equal(dirname(target),realpathSync(root));assert.ok(basename(target).startsWith('billing-ui-'));rmSync(target,{recursive:true,force:true});});
+  const page=await browser.newPage({viewport:{width:1365,height:1000}});page.setDefaultTimeout(10000);const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));await page.addInitScript(()=>localStorage.setItem('teahouse-estimated-usd-cny','7'));
+  await page.goto(`http://${host}`);await page.getByRole('button',{name:'模型连接',exact:true}).click();
+  const selector=page.getByRole('combobox',{name:'默认模型',exact:true});await page.getByText('本地测试模型列表，未访问外部供应商。',{exact:false}).waitFor();await selector.selectOption('gpt-6-astra');
+  assert.equal(await page.getByRole('spinbutton',{name:/输入单价/}).inputValue(),'21');await selector.selectOption('gpt-6.1-sol');assert.equal(await page.getByRole('spinbutton',{name:/输入单价/}).inputValue(),'7');
+  await page.getByRole('navigation',{name:'模型供应商'}).getByRole('button',{name:/DeepSeek/}).click();const panel=page.getByRole('region',{name:'DeepSeek 账户余额'});await panel.getByText('已配置 · 尚未查询验证',{exact:true}).waitFor();assert.equal(financialCalls,0);
+  await panel.getByRole('button',{name:'查询官方余额 / 账单',exact:true}).click();await panel.getByText('¥123.45 CNY',{exact:true}).waitFor();assert.equal(financialCalls,1);assert.ok(!(await page.locator('body').innerText()).includes('fixture-never-real'));
+  await panel.scrollIntoViewIfNeeded();mkdirSync(resolve('output/playwright'),{recursive:true});await page.screenshot({path:resolve('output/playwright/official-balance.png')});
+  await page.getByRole('navigation',{name:'模型供应商'}).getByRole('button',{name:/通义千问/}).click();await page.getByText('配置只读账单凭据',{exact:true}).click();await page.getByLabel('AccessKey ID',{exact:true}).fill('fixture-financial-id');await page.getByLabel('SecretAccessKey',{exact:true}).fill('fixture-financial-secret');await page.getByRole('button',{name:'保存账单凭据',exact:true}).click();await page.getByText('已配置 · 尚未查询验证',{exact:true}).waitFor();assert.equal(await page.getByLabel('SecretAccessKey',{exact:true}).inputValue(),'');assert.equal(financialCalls,1);
+  await page.getByRole('navigation',{name:'模型供应商'}).getByRole('button',{name:/OpenAI/}).click();await page.getByRole('combobox',{name:'OpenAI 接入方式',exact:true}).selectOption('subscription');
+  const quota=page.getByRole('region',{name:'ChatGPT 订阅额度'});await quota.getByText('已用 20% · 剩余 80%',{exact:true}).waitFor();assert.equal(await page.getByRole('region',{name:'模型价格与人民币试算'}).count(),0);await quota.scrollIntoViewIfNeeded();await page.screenshot({path:resolve('output/playwright/subscription-quota.png')});
+  await page.setViewportSize({width:390,height:844});await quota.scrollIntoViewIfNeeded();assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.screenshot({path:resolve('output/playwright/subscription-mobile.png')});assert.deepEqual(errors,[]);
+});

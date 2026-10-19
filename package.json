@@ -1,0 +1,54 @@
+{
+  "name": "chat-teahouse",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local-first multi-model AI group chat with independent participants and configurable pacing.",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/plutoCC/chat-teahouse.git" },
+  "homepage": "https://github.com/plutoCC/chat-teahouse#readme",
+  "bugs": { "url": "https://github.com/plutoCC/chat-teahouse/issues" },
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "tsx server/index.ts",
+    "build": "tsc --noEmit && vite build",
+    "start": "tsx server/index.ts --production",
+    "test": "tsx --test tests/*.test.ts",
+    "check": "tsc --noEmit",
+    "test:browser": "tsx --test tests/browser/*.test.ts",
+    "check:publication": "tsx scripts/check-publication.ts"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "4.0.5",
+    "@deepseek-ai/dsh-agent": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-agent-loop": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-llm": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session-persistence": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-session-projection": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-system-prompt": "0.2.1-rc.2",
+    "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
+    "@fastify/static": "^10.1.6",
+    "fastify": "^5.6.0",
+    "lucide-react": "^0.468.0",
+    "playwright-core": "^1.64.1",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "sharp": "0.35.5",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0"
+  }
+}

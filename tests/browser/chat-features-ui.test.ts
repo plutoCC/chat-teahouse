@@ -1,0 +1,37 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdirSync,mkdtempSync,rmSync,realpathSync,lstatSync} from 'node:fs';
+import {resolve,join,dirname,basename} from 'node:path';
+import {createServer} from 'node:net';
+import {chromium} from 'playwright-core';
+import sharp from 'sharp';
+import {buildApp} from '../../server/app.js';
+import {fixtureModelCatalog} from './model-list-fixture.js';
+
+test('multi-key connection selection, local sticker management and room pacing persist in desktop and mobile UI',{timeout:60000},async t=>{
+  const root=resolve('.test-artifacts');mkdirSync(root,{recursive:true});const dataDir=mkdtempSync(join(root,'chat-features-ui-'));
+  const port=await new Promise<number>((done,reject)=>{const s=createServer();s.once('error',reject);s.listen(0,'127.0.0.1',()=>{const n=(s.address() as {port:number}).port;s.close(()=>done(n));});});
+  const options={dataDir,port,production:true,modelCatalogFetcher:fixtureModelCatalog};let runtime=await buildApp(options);await runtime.app.listen({host:'127.0.0.1',port});
+  const browser=await chromium.launch({channel:process.env.CHAT_TEA_BROWSER_CHANNEL??'msedge',headless:true,chromiumSandbox:true});
+  t.after(async()=>{await browser.close();await runtime.app.close();assert.equal(lstatSync(dataDir).isSymbolicLink(),false);const target=realpathSync(dataDir);assert.equal(dirname(target),realpathSync(root));assert.ok(basename(target).startsWith('chat-features-ui-'));rmSync(target,{recursive:true,force:true});});
+  const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));page.setDefaultTimeout(7000);const url=`http://127.0.0.1:${port}`;
+  await page.route('**/*',r=>r.request().url().startsWith(url)?r.continue():r.abort());await page.goto(url);
+  assert.equal(await page.getByRole('button',{name:'导入外部 AI 回复',exact:true}).count(),0);
+  await page.getByRole('button',{name:'模型连接',exact:true}).click();await page.getByRole('button',{name:'添加 API 连接',exact:true}).click();await page.getByRole('combobox',{name:'连接供应商',exact:true}).selectOption('deepseek');await page.getByRole('textbox',{name:'新连接名称',exact:true}).fill('独立密钥二');await page.getByRole('button',{name:'创建连接',exact:true}).click();
+  await page.getByRole('textbox',{name:'连接名称',exact:true}).fill('独立密钥二');await page.getByLabel(/^API Key/).fill('fixture-only-do-not-call');await page.getByRole('button',{name:'保存连接',exact:true}).click();await page.getByText('连接配置已保存',{exact:true}).waitFor();await page.getByRole('checkbox',{name:'启用此连接',exact:true}).click();await page.getByText('连接已启用并保存',{exact:true}).waitFor();
+  const provider=runtime.store.providers().find(p=>p.label==='独立密钥二')!;assert.ok(provider.connectionId);assert.equal(provider.enabled,true);
+  mkdirSync(resolve('output/playwright'),{recursive:true});await page.getByRole('heading',{name:'模型连接',exact:true}).scrollIntoViewIfNeeded();await page.screenshot({path:resolve('output/playwright/multiple-connections.png')});
+  await page.getByRole('button',{name:'关闭对话框',exact:true}).click();await page.getByRole('button',{name:'成员与设置',exact:true}).click();await page.getByRole('button',{name:'编辑 演示成员 A',exact:true}).click();
+  assert.deepEqual(await page.getByRole('combobox',{name:'连接方式',exact:true}).locator('option').evaluateAll(es=>es.map(e=>(e as HTMLOptionElement).value)),['api','browser']);
+  await page.getByRole('combobox',{name:'模型供应商',exact:true}).selectOption(provider.connectionId!);await page.getByRole('combobox',{name:'模型名称',exact:true}).selectOption(provider.model);await page.getByRole('button',{name:'保存成员',exact:true}).click();await page.getByRole('dialog').waitFor({state:'hidden'});
+  assert.equal(runtime.store.profiles().find(p=>p.name==='演示成员 A')!.connectionId,provider.connectionId);
+  await page.locator('.details-tabs').getByRole('button',{name:'讨论设置',exact:true}).click();assert.equal(await page.getByRole('spinbutton',{name:'最短发言间隔（秒）',exact:true}).inputValue(),'1');
+  await page.getByRole('spinbutton',{name:'最短发言间隔（秒）',exact:true}).fill('18');await page.getByRole('spinbutton',{name:'最长发言间隔（秒）',exact:true}).fill('35');await page.getByRole('spinbutton',{name:'用户输入保护（秒）',exact:true}).fill('15');await page.getByRole('checkbox',{name:'允许 AI 从本地表情库选择表情',exact:true}).uncheck();await page.getByRole('button',{name:'保存自主群聊设置',exact:true}).click();await page.getByText('自主群聊设置已保存',{exact:true}).waitFor();await page.screenshot({path:resolve('output/playwright/chat-pacing.png')});
+  await page.getByRole('button',{name:'关闭设置',exact:true}).click();await page.getByRole('button',{name:'管理表情包',exact:true}).click();await page.getByRole('textbox',{name:'表情名称',exact:true}).fill('茶杯赞同');await page.getByRole('textbox',{name:'情绪 / 使用标签',exact:true}).fill('赞同，轻松');
+  const png=await sharp(Buffer.from('<svg width="180" height="160"><rect width="180" height="160" rx="22" fill="#e6eddc"/><path d="M40 55h88v40a35 35 0 0 1-35 35H75a35 35 0 0 1-35-35z" fill="#658467"/><path d="M129 61h9a20 20 0 0 1 0 36h-9" fill="none" stroke="#658467" stroke-width="10"/><path d="M65 39l13 10 27-28" fill="none" stroke="#385f41" stroke-width="8"/></svg>')).png().toBuffer();
+  await page.getByLabel(/^表情图片/).setInputFiles({name:'tea.png',mimeType:'image/png',buffer:png});await page.getByRole('button',{name:'上传表情包',exact:true}).click();await page.getByRole('article',{name:'表情 茶杯赞同',exact:true}).waitFor();assert.equal(runtime.store.stickers().length,1);await page.screenshot({path:resolve('output/playwright/local-stickers.png')});
+  await page.getByRole('button',{name:'关闭对话框',exact:true}).click();await page.getByRole('button',{name:'表情包',exact:true}).click();await page.getByRole('button',{name:'发送 茶杯赞同',exact:true}).click();await page.getByRole('dialog').waitFor({state:'hidden'});await page.getByRole('img',{name:'表情包：茶杯赞同',exact:true}).waitFor();assert.equal(await page.getByRole('img',{name:'表情包：茶杯赞同',exact:true}).evaluate(async(e:HTMLImageElement)=>{await e.decode();return e.naturalWidth>0;}),true);
+  await runtime.app.close();runtime=await buildApp(options);await runtime.app.listen({host:'127.0.0.1',port});await page.reload();await page.getByRole('img',{name:'表情包：茶杯赞同',exact:true}).waitFor();const group=runtime.store.groups()[0];assert.equal(group.freeSettings!.messageGapMax,35);assert.equal(group.freeSettings!.allowStickers,false);assert.equal(group.participants[0].connectionId,provider.connectionId);
+  await page.setViewportSize({width:390,height:844});await page.getByRole('button',{name:'成员与设置',exact:true}).click();await page.getByRole('button',{name:'管理表情包',exact:true}).click();assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await page.screenshot({path:resolve('output/playwright/local-stickers-mobile.png')});
+  await page.getByRole('button',{name:'删除 茶杯赞同',exact:true}).click();await page.getByRole('button',{name:'确认删除 茶杯赞同',exact:true}).click();await page.getByRole('article',{name:'表情 茶杯赞同',exact:true}).waitFor({state:'hidden'});await page.getByRole('button',{name:'已删除表情',exact:true}).click();await page.getByRole('button',{name:'恢复 茶杯赞同',exact:true}).click();await page.getByRole('article',{name:'表情 茶杯赞同',exact:true}).waitFor({state:'hidden'});assert.equal(runtime.store.stickers().length,1);assert.deepEqual(errors,[]);
+});

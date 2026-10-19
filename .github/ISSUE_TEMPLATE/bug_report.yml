@@ -1,0 +1,32 @@
+name: 问题反馈
+description: 使用虚构数据描述可以复现的问题
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: 请勿上传密钥、Cookie、真实聊天、整个 data 目录或未脱敏的日志。安全问题请使用仓库的私密漏洞报告。
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 项目版本、操作系统、Node.js 版本、浏览器，以及相关模型渠道（不含密钥）
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 请使用虚构群聊和最小示例
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 预期与实际表现
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostic
+    attributes:
+      label: 已脱敏的诊断信息（可选）
+      description: 仅保留必要的错误类别；不要粘贴完整请求、响应或私有推理。

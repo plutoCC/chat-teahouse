@@ -33,7 +33,7 @@
     "@deepseek-ai/dsh-tools": "0.2.1-rc.2",
     "@fastify/static": "^10.1.6",
     "fastify": "^5.6.0",
-    "lucide-react": "^0.468.0",
+    "lucide-react": "^1.57.0",
     "playwright-core": "^1.64.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

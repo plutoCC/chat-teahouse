@@ -2,9 +2,11 @@ param(
   [ValidateSet('Start', 'Stop', 'Status')][string]$Action = 'Start',
   [switch]$Foreground,
   [switch]$SkipBuild,
+  [switch]$OpenBrowser,
   [ValidateRange(1024, 65535)][int]$Port = 4317
 )
 $ErrorActionPreference = 'Stop'
+if ($Foreground -and $OpenBrowser) { throw 'Use -OpenBrowser for background startup, or -Foreground alone for diagnostics.' }
 Set-Location -LiteralPath $PSScriptRoot
 if ($env:PORT -and -not $PSBoundParameters.ContainsKey('Port')) { $Port = [int]$env:PORT }
 if ($Port -lt 1024 -or $Port -gt 65535) { throw 'PORT must be between 1024 and 65535.' }
@@ -27,11 +29,21 @@ function Get-TeaHealth {
 function Test-TeaHealth($Health) {
   return ($Health -and $Health.ok -and ($Health.application -eq 'chat-teahouse' -or $Health.runtime -eq 'deepseek-harness'))
 }
+function Open-TeaWebsite {
+  if ($OpenBrowser) {
+    try { Start-Process -FilePath ($teaUrl + '/') | Out-Null }
+    catch { throw ('The server is running, but the browser could not open. Open ' + $teaUrl + '/ manually.') }
+  }
+}
 try {
   if ($Action -eq 'Start') {
     $teaMutex = New-Object System.Threading.Mutex($false, ('Local\ChatTeahouseLaunch-' + $Port))
     try { $teaLockHeld = $teaMutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $teaLockHeld = $true }
-    if (-not $teaLockHeld) { Write-Host 'Teahouse is already being started in another window.'; exit 0 }
+    if (-not $teaLockHeld) {
+      Write-Host 'Waiting for the other launch window to finish...'
+      try { $teaLockHeld = $teaMutex.WaitOne(120000) } catch [System.Threading.AbandonedMutexException] { $teaLockHeld = $true }
+      if (-not $teaLockHeld) { throw 'Startup is still in progress. Check the first launch window and try again when it finishes.' }
+    }
   }
   $teaHealth = Get-TeaHealth
   if ($Action -eq 'Status') {
@@ -55,13 +67,17 @@ try {
     }
     throw 'Shutdown was requested but has not completed. Check the service logs before restarting.'
   }
-  if (Test-TeaHealth $teaHealth) { Write-Host ('Already running: ' + $teaUrl); exit 0 }
+  if (Test-TeaHealth $teaHealth) { Write-Host ('Already running: ' + $teaUrl); Open-TeaWebsite; exit 0 }
   if ($teaHealth) { throw 'The selected port belongs to another application.' }
   $teaProbe = New-Object System.Net.Sockets.TcpClient
   $teaPortBusy = $false
   try { $teaProbe.Connect('127.0.0.1', $Port); $teaPortBusy = $true } catch {} finally { $teaProbe.Dispose() }
   if ($teaPortBusy) { throw 'The port is in use but its health check failed. Refusing to start a second server.' }
-  $teaNode = (Get-Command node -ErrorAction Stop).Source
+  $teaNodeCommand = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $teaNodeCommand) { throw 'Node.js 24 is required. Install it from https://nodejs.org/ and then launch Teahouse again.' }
+  $teaNode = $teaNodeCommand.Source
+  $teaNodeMajor = & $teaNode -p 'parseInt(process.versions.node)'
+  if ($LASTEXITCODE -ne 0 -or [int]$teaNodeMajor -lt 24) { throw 'Node.js 24 or newer is required. Install Node.js 24 and then launch Teahouse again.' }
   if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'node_modules'))) {
     & npm.cmd ci --ignore-scripts
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
@@ -86,7 +102,7 @@ try {
   if ($teaCreated.ReturnValue -ne 0) { throw ('Windows could not launch the background host (code ' + $teaCreated.ReturnValue + '). Use -Foreground to diagnose.') }
   for ($i = 0; $i -lt 40; $i++) {
     $teaHealth = Get-TeaHealth
-    if (Test-TeaHealth $teaHealth) { Write-Host ('Running independently in background: ' + $teaUrl); Write-Host 'Use Stop-Teahouse.cmd to stop the local server.'; exit 0 }
+    if (Test-TeaHealth $teaHealth) { Write-Host ('Running independently in background: ' + $teaUrl); Write-Host 'Use Stop-Teahouse.cmd to stop the local server.'; Open-TeaWebsite; exit 0 }
     Start-Sleep -Milliseconds 250
   }
   throw ('Server did not become ready. Check ' + (Join-Path $teaData 'service-logs') + ' or run with -Foreground.')

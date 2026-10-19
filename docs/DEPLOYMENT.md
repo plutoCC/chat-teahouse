@@ -31,13 +31,15 @@ npm start
 
 ## Windows 隐藏后台
 
-双击根目录 `Start-Teahouse.cmd`，或者在 PowerShell 中运行：
+双击根目录 **`Launch-Teahouse.cmd`**（`Start-Teahouse.cmd` 同样支持），或者在 PowerShell 中运行：
 
 ```powershell
-.\Start-Teahouse.ps1
+.\Start-Teahouse.ps1 -OpenBrowser
 ```
 
-脚本会在依赖缺失时安装、构建界面并启动隐藏后台进程；启动窗口关闭后仍运行，重复启动会复用现有服务，不创建第二个实例。没有设置开机自动启动。
+脚本会检查 Node.js 版本，在依赖缺失时安装、构建界面并启动隐藏后台进程，健康检查通过后打开默认浏览器。首次运行需要等待安装与构建。启动窗口关闭后后台仍运行，重复启动会打开现有服务，不创建第二个实例。端口占用或启动失败时不会打开错误的页面，窗口会保留错误提示。没有设置开机自动启动。
+
+可以创建启动脚本的桌面快捷方式，但不要单独移动脚本。CMD 入口只对本次 PowerShell 子进程使用 `-ExecutionPolicy Bypass`，不会修改系统执行策略；组织组策略仍可能阻止脚本。直接运行 PowerShell 脚本时，省略 `-OpenBrowser` 可只启动后台；该参数不与 `-Foreground` 同用。自定义端口示例：`.\Start-Teahouse.ps1 -OpenBrowser -Port 4318`。
 
 ```powershell
 .\Start-Teahouse.ps1 -Action Status

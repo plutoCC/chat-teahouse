@@ -51,3 +51,4 @@ docs/*
 !docs/images/
 docs/images/*
 !docs/images/demo.png
+!docs/images/demo-mentions.png

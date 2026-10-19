@@ -34,4 +34,4 @@ jobs:
         if: runner.os == 'Windows'
         env:
           CHAT_TEA_BROWSER_CHANNEL: msedge
-        run: npx tsx --test tests/browser/free-chat-ui.test.ts tests/browser/publication-status-ui.test.ts
+        run: npx tsx --test tests/browser/free-chat-ui.test.ts tests/browser/publication-status-ui.test.ts tests/browser/notebook-ui.test.ts tests/browser/draft-wait-ui.test.ts

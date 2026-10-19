@@ -28,6 +28,31 @@ function fixture(t:TestContext,run?:(wake:RuntimeWake)=>Promise<void>,native?:Na
 }
 const tool=(name:string,args:object,id=crypto.randomUUID())=>({blocks:[{type:'tool-call' as const,id:ToolCallId(id),name,arguments:JSON.stringify(args)}],inputTokens:10,outputTokens:10});
 
+test('draft waiting prevents new model admission until clearing plus three seconds, even beyond the old typing grace',async t=>{
+  let now=Date.now(),calls=0;const f=fixture(t,async w=>{calls++;w.read();await w.post('输入完成之后再发言',undefined,'draft-admission');},undefined,{now:()=>now});
+  f.group.participants=f.group.participants.slice(0,1);f.group.freeSettings={...f.group.freeSettings!,waitForUserDraft:true,messageStyle:'single'};f.store.saveGroup(f.group);
+  const clientId=crypto.randomUUID();f.engine.draftPresence(f.group.id,{clientId,sequence:1,hasDraft:true,reason:'edit'});f.engine.start(f.group.id);
+  for(let n=2;n<6;n++){now+=20000;f.engine.draftPresence(f.group.id,{clientId,sequence:n,hasDraft:true,reason:'edit'});f.engine.pump(f.group.id);await Promise.resolve();assert.equal(calls,0);}
+  f.engine.draftPresence(f.group.id,{clientId,sequence:6,hasDraft:false,reason:'edit'});now+=2999;f.engine.pump(f.group.id);await Promise.resolve();assert.equal(calls,0);
+  now++;f.engine.pump(f.group.id);await f.engine.settle(f.group.id);assert.equal(calls,1);assert.equal(f.store.messages(f.group.id).length,1);
+});
+
+test('draft waiting blocks an already thinking member and the zero-delay publication fast path',async t=>{
+  let finish!:()=>void;const f=fixture(t,async w=>{w.read();await new Promise<void>(r=>{finish=r;});await w.post('准备好的回复',undefined,'draft-queued');});
+  f.group.participants=f.group.participants.slice(0,1);f.group.freeSettings={...f.group.freeSettings!,waitForUserDraft:true,messageStyle:'single'};f.store.saveGroup(f.group);f.engine.start(f.group.id);await waitUntil(()=>!!finish);
+  const clientId=crypto.randomUUID();f.engine.draftPresence(f.group.id,{clientId,sequence:1,hasDraft:true,reason:'edit'});finish();
+  await waitUntil(()=>f.store.freeSession(f.group.id)!.members[0].activity==='等待用户完成输入');assert.equal(f.store.messages(f.group.id).length,0);
+  f.engine.draftPresence(f.group.id,{clientId,sequence:2,hasDraft:false,reason:'sent'});await f.engine.settle(f.group.id);assert.equal(f.store.messages(f.group.id).length,1);
+});
+
+test('draft waiting pauses an in-flight segmented speech and resumes it after the user submits',async t=>{
+  const f=fixture(t,async w=>{w.read();await w.post('第一段，等待参与。\n\n第二段，补充观点。',undefined,'draft-segments');});
+  f.group.participants=f.group.participants.slice(0,1);f.group.freeSettings={...f.group.freeSettings!,waitForUserDraft:true,messageStyle:'segmented'};f.store.saveGroup(f.group);f.engine.start(f.group.id);await waitUntil(()=>f.store.messages(f.group.id).length===1);
+  const clientId=crypto.randomUUID();f.engine.draftPresence(f.group.id,{clientId,sequence:1,hasDraft:true,reason:'edit'});
+  await waitUntil(()=>f.store.freeSession(f.group.id)!.members[0].activity==='等待用户完成输入（连发已暂缓）');assert.equal(f.store.messages(f.group.id).length,1);
+  f.engine.draftPresence(f.group.id,{clientId,sequence:2,hasDraft:false,reason:'sent'});await f.engine.settle(f.group.id);assert.equal(f.store.messages(f.group.id).length,2);assert.ok(f.store.messages(f.group.id).every(m=>m.speech?.state==='complete'));
+});
+
 test('a completed prose reply is privately corrected into a publish action instead of a fabricated wait',async t=>{
   let calls=0;const draft='我有不同的判断，需要把依据展开。\n\n这里是补充依据。';
   const f=fixture(t,undefined,async options=>{

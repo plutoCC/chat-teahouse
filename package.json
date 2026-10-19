@@ -4,9 +4,14 @@
   "private": true,
   "description": "Local-first multi-model AI group chat with independent participants and configurable pacing.",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/plutoCC/chat-teahouse.git" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/plutoCC/chat-teahouse.git"
+  },
   "homepage": "https://github.com/plutoCC/chat-teahouse#readme",
-  "bugs": { "url": "https://github.com/plutoCC/chat-teahouse/issues" },
+  "bugs": {
+    "url": "https://github.com/plutoCC/chat-teahouse/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=24"
@@ -39,7 +44,10 @@
     "react-dom": "^19.2.0",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
+    "remark-parse": "11.0.0",
+    "remark-rehype": "11.1.2",
     "sharp": "0.35.5",
+    "unified": "11.0.5",
     "zod": "^4.1.0"
   },
   "devDependencies": {

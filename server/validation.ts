@@ -68,6 +68,7 @@ export const freeSettingsSchema = z.object({
   messageGapMax:z.number().min(0).max(300).optional(),
   readingCharsPerSecond:z.number().min(0).max(60).optional(),
   typingGraceSeconds:z.number().min(0).max(60).optional(),
+  waitForUserDraft:z.boolean().optional(),
   allowStickers:z.boolean().optional(),
   stickerCooldownSeconds:z.number().min(0).max(600).optional(),
   quietSeconds: z.number().min(0).max(30),

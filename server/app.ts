@@ -32,6 +32,7 @@ import {generateNative} from './runtime-adapters/native-model.js';
 import {ModelCallError} from './model-errors.js';
 import {BillingService,billingCredentialsSchema,billingRefreshSchema} from './billing.js';
 import { seedSkills, skillSummaries, importInstructionSkill } from './skills.js';
+import {installNotebook} from './notebook.js';
 
 export interface AppOptions { dataDir:string; port:number; production:boolean; serveUI?:boolean; generate?:(r:CompletionRequest)=>Promise<CompletionResult>; browserDriver?:BrowserDriver; nativeGenerate?:NativeGenerate; participantRuntime?:ParticipantRuntime; modelCatalogFetcher?:typeof fetchModelCatalog; subscription?:SubscriptionService; billingFetcher?:typeof fetch; }
 export async function buildApp(options:AppOptions) {
@@ -46,6 +47,7 @@ export async function buildApp(options:AppOptions) {
   const avatars=new AvatarUploads(store);
   const stickerLibrary=new StickerLibrary(store);
   const {csrfToken}=installSecurity(app,{port:options.port,production:options.production});
+  installNotebook(app,store);
   const clients=new Set<ServerResponse>();
   const notify=(groupId?:string)=>{const data=`event: change\ndata: ${JSON.stringify({groupId})}\n\n`;for(const client of clients){if(client.destroyed||client.writableEnded){clients.delete(client);continue;}if(client.writableLength>262144){client.destroy();clients.delete(client);continue;}client.write(data);}};
   const providers=()=>store.providers().map(p=>({...p,hasKey:vault.has(connectionKey(p))}));
@@ -68,6 +70,10 @@ export async function buildApp(options:AppOptions) {
   app.post<{Params:{id:string}}>('/api/stickers/:id/restore',async request=>{emptyBodySchema.parse(request.body??{});const s=store.sticker(idSchema.parse(request.params.id));if(!s)throw new DiscussionError('表情包不存在。',404);delete s.deletedAt;store.saveSticker(s);notify();return s;});
   app.get<{Params:{id:string}}>('/api/sticker-assets/:id',async(request,reply)=>{const bytes=store.stickerAsset(avatarAssetIdSchema.parse(request.params.id));if(!bytes)throw new DiscussionError('表情图片不存在。',404);return reply.type('image/webp').send(bytes);});
   app.post<{Params:{id:string}}>('/api/groups/:id/typing',async request=>{emptyBodySchema.parse(request.body??{});getGroup(request.params.id);roomEngine.typing(request.params.id);return {ok:true};});
+  app.post<{Params:{id:string}}>('/api/groups/:id/draft-presence',async request=>{
+    const data=z.object({clientId:z.string().uuid(),sequence:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),hasDraft:z.boolean(),reason:z.enum(['edit','sent','leave'])}).strict().parse(request.body);
+    getGroup(request.params.id);roomEngine.draftPresence(request.params.id,data);return {ok:true};
+  });
   app.post<{Params:{id:string}}>('/api/groups/:id/stickers',async(request,reply)=>{
     const g=getGroup(request.params.id);if(g.archived)throw new DiscussionError('请先恢复群聊。');
     const data=z.object({stickerId:idSchema,caption:z.string().trim().max(1000).optional()}).strict().parse(request.body);

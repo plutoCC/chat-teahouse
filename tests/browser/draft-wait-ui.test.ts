@@ -1,0 +1,34 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdirSync,mkdtempSync,realpathSync,rmSync,lstatSync} from 'node:fs';
+import {resolve,join,dirname} from 'node:path';
+import {createServer} from 'node:net';
+import {setTimeout as sleep} from 'node:timers/promises';
+import {chromium} from 'playwright-core';
+import {ToolCallId} from '@deepseek-ai/dsh-llm';
+import {buildApp} from '../../server/app.js';
+import {defaultFreeSettings} from '../../shared/free-chat.js';
+
+test('nonempty composer holds AI without further typing, empty composer waits three seconds, and send releases the draft',{timeout:45000},async t=>{
+  const root=resolve('.test-artifacts');mkdirSync(root,{recursive:true});const dataDir=mkdtempSync(join(root,'draft-ui-'));
+  const port=await new Promise<number>(done=>{const s=createServer();s.listen(0,'127.0.0.1',()=>{const n=(s.address() as {port:number}).port;s.close(()=>done(n));});});
+  let calls=0;const runtime=await buildApp({dataDir,port,production:true,nativeGenerate:async()=>({blocks:[{type:'tool-call',id:ToolCallId(crypto.randomUUID()),name:'post_message',arguments:JSON.stringify({content:`模拟回复 ${++calls}`})}],inputTokens:10,outputTokens:10})});
+  const host=`127.0.0.1:${port}`,boot=(await runtime.app.inject({url:'/api/bootstrap',headers:{host}})).json(),headers={host,origin:`http://${host}`,'x-csrf-token':boot.csrfToken};
+  await runtime.app.inject({method:'PUT',url:'/api/providers/openai',headers,payload:{enabled:true,apiKey:'local-fixture-only'}});
+  const group=runtime.store.groups()[0];group.name='输入等待 · 本地模拟';group.conversationMode='free';group.participants=group.participants.slice(0,1).map(p=>({...p,providerId:'openai',model:'fixture-model',name:'等待员'}));group.settings.budgetUSD=0;
+  group.freeSettings={...defaultFreeSettings,waitForUserDraft:true,messageStyle:'single',messageGapMin:0,messageGapMax:0,typingGraceSeconds:1,quietSeconds:0,cooldownMin:300,cooldownMax:300,concurrency:1,wakeProbability:0,respondToAI:false};runtime.store.saveGroup(group);
+  const other=runtime.store.createGroup('另一个群','');other.updatedAt='2020-01-01';runtime.store.saveGroup(other);
+  await runtime.app.listen({host:'127.0.0.1',port});const browser=await chromium.launch({channel:process.env.CHAT_TEA_BROWSER_CHANNEL??'msedge',headless:true,chromiumSandbox:true});
+  t.after(async()=>{await browser.close();await runtime.app.close();assert.equal(lstatSync(dataDir).isSymbolicLink(),false);assert.equal(dirname(realpathSync(dataDir)),realpathSync(root));rmSync(dataDir,{recursive:true,force:true});});
+  const page=await browser.newPage({viewport:{width:1440,height:1000}}),errors:string[]=[],presence:unknown[]=[];page.on('pageerror',e=>errors.push(e.message));page.on('request',r=>{if(r.url().endsWith('/draft-presence'))presence.push(r.postDataJSON());});
+  await page.goto(`http://${host}`);await page.getByRole('heading',{name:group.name,exact:true}).waitFor();const input=page.getByRole('textbox',{name:'输入讨论问题',exact:true});
+  await input.fill('这是未发送的私人草稿');await page.getByRole('button',{name:'开始讨论',exact:true}).click();await page.getByText('等待用户完成输入',{exact:true}).first().waitFor();
+  await sleep(2200);assert.equal(calls,0,'pausing keystrokes must not release a nonempty composer');
+  await page.locator('.group-item').filter({hasText:'另一个群'}).click();await page.getByRole('heading',{name:'另一个群',exact:true}).waitFor();assert.equal(calls,0);await page.locator('.group-item').filter({hasText:group.name}).click();await page.getByRole('heading',{name:group.name,exact:true}).waitFor();assert.equal(await input.inputValue(),'这是未发送的私人草稿');
+  await input.fill('');await page.getByText('输入框已清空，等待 3 秒',{exact:true}).first().waitFor();await sleep(1800);assert.equal(calls,0);await page.getByText('模拟回复 1',{exact:true}).waitFor({timeout:4000});
+  await input.fill('@等待员 我发送新的观点');await page.getByRole('button',{name:'加入讨论',exact:true}).click();await page.getByText('模拟回复 2',{exact:true}).waitFor();assert.equal(await input.inputValue(),'');
+  assert.ok(presence.length>=4);assert.ok(!JSON.stringify(presence).includes('私人草稿'));assert.ok(presence.some(p=>(p as {reason:string}).reason==='sent'));
+  await page.getByRole('button',{name:'暂停讨论',exact:true}).click();await page.getByRole('button',{name:'讨论设置',exact:true}).click();await page.getByRole('checkbox',{name:'等待用户输入完成（输入框有文字就等待）',exact:true}).waitFor();assert.equal(await page.getByRole('checkbox',{name:'等待用户输入完成（输入框有文字就等待）',exact:true}).isChecked(),true);
+  await page.waitForFunction(()=>{const panel=document.querySelector('.details-panel');return panel&&panel.getBoundingClientRect().right<=innerWidth;});await page.getByRole('checkbox',{name:'等待用户输入完成（输入框有文字就等待）',exact:true}).scrollIntoViewIfNeeded();
+  mkdirSync(resolve('output/playwright'),{recursive:true});await page.screenshot({path:resolve('output/playwright/draft-wait-settings.png')});assert.deepEqual(errors,[]);
+});

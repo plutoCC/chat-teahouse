@@ -6,6 +6,7 @@ import { defaultSettings, profileFields, connectionKey, type Sticker, type Membe
 import { defaultFreeSettings, type FreeSession, type RoomEvent, type SkillDefinition } from '../shared/free-chat.js';
 import type {MemberUsage,RoomUsage,RoomLogEntry} from '../shared/room-journal.js';
 import type {GroupSettingsTemplate} from '../shared/types.js';
+import type {NotebookEntry} from '../shared/notebook.js';
 
 export interface CallReservation { id: string; groupId: string; sessionId: string; input: number; output: number; usd: number; inputPrice: number; outputPrice: number; memberId?:string;author?:string;model?:string;providerId?:string;connectionId?:string;actualInput?:number;actualOutput?:number;actualUSD?:number;billingMode?:'api'|'subscription'; }
 
@@ -18,6 +19,8 @@ export class Store {
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS groups (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS app_settings (id TEXT PRIMARY KEY, data TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS notebook (id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id), data TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS notebook_group ON notebook(group_id);
       CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id), run_id TEXT, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES groups(id), data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS providers (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -44,6 +47,11 @@ export class Store {
     this.adoptMemberProfiles();
   }
   close() { this.db.close(); }
+  notebookEntries(groupId?:string):NotebookEntry[] { return (groupId?this.rows<NotebookEntry>('SELECT data FROM notebook WHERE group_id=?',groupId):this.rows<NotebookEntry>('SELECT data FROM notebook')).sort((a,b)=>b.updatedAt.localeCompare(a.updatedAt)); }
+  notebookCount():number { return Number(this.db.prepare('SELECT count(*) AS n FROM notebook').get()!.n); }
+  notebookEntry(id:string):NotebookEntry|undefined { return this.one<NotebookEntry>('SELECT data FROM notebook WHERE id=?',id); }
+  saveNotebookEntry(entry:NotebookEntry) { this.db.prepare('INSERT INTO notebook(id,group_id,data) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(entry.id,entry.groupId,JSON.stringify(entry)); }
+  deleteNotebookEntry(id:string) { this.db.prepare('DELETE FROM notebook WHERE id=?').run(id); }
   stickers(includeDeleted=false):Sticker[] { return this.rows<Sticker>('SELECT data FROM stickers ORDER BY rowid').filter(s=>includeDeleted||!s.deletedAt); }
   sticker(id:string):Sticker|undefined { return this.one<Sticker>('SELECT data FROM stickers WHERE id=?',id); }
   saveSticker(sticker:Sticker) { this.db.prepare('INSERT INTO stickers(id,data) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(sticker.id,JSON.stringify(sticker)); }

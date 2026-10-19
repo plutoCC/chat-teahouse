@@ -10,6 +10,8 @@ import { splitChatMessage } from './segments.js';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {inferredMentions} from '../../shared/mentions.js';
 import type {LogInput} from '../../shared/room-journal.js';
+import {DraftPresence} from './draft-presence.js';
+import type {DraftPresenceUpdate} from '../../shared/typing.js';
 class BudgetWaitError extends ModelCallError {}
 
 interface EngineDeps {
@@ -28,10 +30,13 @@ export class RoomEngine {
   private closed=false;
   private publicationGate:PublicationGate;
   private typingUntil=new Map<string,number>();
+  private drafts:DraftPresence;
   private speeches=new Map<string,{memberId:string;speechId:string;beforeSeq:number}>();
   private now:()=>number;
   private random:()=>number;
-  constructor(private store:Store,private deps:EngineDeps) {this.now=deps.now??Date.now;this.random=deps.random??Math.random;this.publicationGate=new PublicationGate(this.now);}
+  constructor(private store:Store,private deps:EngineDeps) {this.now=deps.now??Date.now;this.random=deps.random??Math.random;this.publicationGate=new PublicationGate(this.now);this.drafts=new DraftPresence(this.now);}
+  draftPresence(groupId:string,update:DraftPresenceUpdate){this.requireGroup(groupId);this.drafts.update(groupId,update);if(this.active(groupId))this.schedule(groupId,0);}
+  private inputHold(groupId:string){const settings=this.requireGroup(groupId).freeSettings;return settings?.waitForUserDraft?this.drafts.status(groupId):{until:this.typingUntil.get(groupId)??0,hasDraft:false};}
   typing(groupId:string){
     if(!this.active(groupId))return;
     const g=this.requireGroup(groupId),seconds=g.freeSettings?.typingGraceSeconds??defaultFreeSettings.typingGraceSeconds!;
@@ -103,6 +108,14 @@ export class RoomEngine {
     const session=this.store.freeSession(groupId);if(!session||session.status!=='active'||this.closed)return;
     const group=this.requireGroup(groupId),settings={...defaultFreeSettings,...group.freeSettings},now=this.now();
     if(now>=session.deadline){this.limit(groupId,'达到本场自动讨论时限。');return;}
+    const input=settings.waitForUserDraft?this.drafts.status(groupId):{until:0,hasDraft:false};
+    if(input.until>now){
+      const activity=input.hasDraft?'等待用户完成输入':'输入框已清空，等待 3 秒';
+      if(session.members.some(m=>!this.jobs.has(`${groupId}:${m.id}`)&&m.status!=='error'&&m.activity!==activity)){
+        this.store.mutateFree(groupId,s=>{for(const m of s.members)if(!this.jobs.has(`${groupId}:${m.id}`)&&m.status!=='error'){m.activity=activity;}});this.deps.notify(groupId);
+      }
+      this.schedule(groupId,Math.min(1000,input.until-now,session.deadline-now));return;
+    }
     // Human messages remain visible in the UI; model admission waits for the whole speech.
     if(this.speeches.has(groupId)){this.schedule(groupId,session.deadline-now);return;}
     const events=this.store.events(groupId);let nextAt=session.deadline;
@@ -261,6 +274,13 @@ export class RoomEngine {
           try {
             for(let index=0;index<parts.length;index++) {
               if(index)await sleep(segmentDelayMs(parts[index-1],settings.readingCharsPerSecond),undefined,{signal});
+              if(settings.waitForUserDraft){
+                while(this.drafts.status(groupId).until>this.now()){
+                  assertActive();const state=this.drafts.status(groupId),activity=state.hasDraft?'等待用户完成输入（连发已暂缓）':'输入框已清空，等待 3 秒';
+                  if(this.store.freeSession(groupId)?.members.find(m=>m.id===member.id)?.activity!==activity){update(m=>{m.activity=activity;});this.deps.notify(groupId);}
+                  await sleep(Math.min(500,Math.max(1,state.until-this.now())),undefined,{signal});
+                }
+              }
               assertActive();sent.push(commit(index,speechId));update(m=>{m.status='sending';m.activity=`正在发送 ${index+1}/${parts.length}`;});this.deps.notify(groupId);
             }
             complete();completed=true;
@@ -285,11 +305,11 @@ export class RoomEngine {
           throw error;
         };
         const publish=parts.length>1?publishSpeech:publishOne;
-        if(parts.length===1&&!this.publicationGate.busy(groupId)&&settings.messageGapMin===0&&settings.messageGapMax===0&&!settings.readingCharsPerSecond&&!settings.typingGraceSeconds){try{return publishOne();}catch(error){return rejected(error);}}
+        if(parts.length===1&&!this.publicationGate.busy(groupId)&&settings.messageGapMin===0&&settings.messageGapMax===0&&!settings.readingCharsPerSecond&&!settings.typingGraceSeconds&&this.inputHold(groupId).until<=this.now()){try{return publishOne();}catch(error){return rejected(error);}}
         update(m=>{m.status='queued';m.activity=this.speeches.has(groupId)?'等待群友发完整组消息':'已准备发言，排队发送';delete m.queuedUntil;});this.deps.notify(groupId);
         const due=()=>{
-          const current=this.store.freeSession(groupId),gap=current?.nextPublishAt??0,typing=this.typingUntil.get(groupId)??0,at=Math.max(gap,typing),now=this.now();
-          const activity=at<=now?'即将发送':typing>=gap?'等待用户输入保护':'等待阅读 / 发送间隔',until=at>now?at:undefined;
+          const input=this.inputHold(groupId),current=this.store.freeSession(groupId),gap=current?.nextPublishAt??0,typing=input.until,at=Math.max(gap,typing),now=this.now();
+          const activity=at<=now?'即将发送':input.hasDraft?'等待用户完成输入':typing>=gap?(settings.waitForUserDraft?'输入框已清空，等待 3 秒':'等待用户输入保护'):'等待阅读 / 发送间隔',until=at>now&&!input.hasDraft?at:undefined;
           const state=current?.members.find(m=>m.id===member.id);
           if(state?.activity!==activity||state?.queuedUntil!==until){update(m=>{m.activity=activity;m.queuedUntil=until;});this.deps.notify(groupId);}
           return at;

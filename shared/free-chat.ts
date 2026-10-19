@@ -4,6 +4,7 @@ export interface FreeChatSettings {
   messageGapMax?: number;
   readingCharsPerSecond?: number;
   typingGraceSeconds?: number;
+  waitForUserDraft?: boolean;
   allowStickers?: boolean;
   stickerCooldownSeconds?: number;
   quietSeconds: number;
@@ -16,6 +17,7 @@ export interface FreeChatSettings {
 }
 export const defaultFreeSettings: FreeChatSettings = {
   messageStyle:'segmented', messageGapMin:1, messageGapMax:3, readingCharsPerSecond:0, typingGraceSeconds:2,
+  waitForUserDraft:false,
   allowStickers:true, stickerCooldownSeconds:60,
   quietSeconds: 1, cooldownMin: 2, cooldownMax: 5,
   concurrency: 2, maxMinutes: 30, wakeProbability: 1, respondToAI: true,

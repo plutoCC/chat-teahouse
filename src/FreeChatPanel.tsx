@@ -48,7 +48,8 @@ export function FreeSettingsForm({ group, disabled, save }: { group: Group; disa
     <small>长回复按自然段和句子拆成短消息，代码块与表格保持完整。其他 AI 读完整组再接话；拆分不额外调用模型。暂停立即停止剩余段落。</small>
     <div className="free-form-grid">{number('最短发言间隔（秒）','messageGapMin',0,300)}{number('最长发言间隔（秒）','messageGapMax',free.messageGapMin??0,300)}</div><small>这是两次完整发言之间的基础间隔，默认随机 1–3 秒；会与最后一条消息的阅读时间取较长者。实际回复还需要模型生成时间。</small>
     {number('阅读速度（字 / 秒，0 关闭）','readingCharsPerSecond',0,60)}<small>连发时按上一段字数 ÷ 阅读速度等待，最短 1 秒、最长 90 秒。最后一段也预留阅读时间，不重复计算整篇；整条发送同样生效。填 0 时连发固定每秒一段。例如 100 字、20 字 / 秒，约等待 5 秒。</small>
-    {number('用户输入保护（秒）','typingGraceSeconds',0,60)}<small>你正在输入或刚发言时，暂缓下一组 AI 发言。已经开始的连发按阅读节奏继续，新的人类消息会在接话前交付给其他成员。</small>
+    <label className="free-checkbox"><input type="checkbox" checked={free.waitForUserDraft??false} onChange={e=>setFree({...free,waitForUserDraft:e.target.checked})}/>等待用户输入完成（输入框有文字就等待）</label>
+    {free.waitForUserDraft?<small>输入框有文字时，暂停新一轮判断及 AI 消息发送，已经开始的连发也会等你。停下打字不会自动恢复；删光文字后等待 3 秒，发送成功后按正常阅读 / 发送节奏继续。切换群聊会保留各群草稿的等待；关闭网页则释放等待，意外断线最多 90 秒后释放。本场时限仍生效。</small>:<>{number('用户输入保护（秒）','typingGraceSeconds',0,60)}<small>你正在输入或刚发言时，暂缓下一组 AI 发言。已经开始的连发按阅读节奏继续，新的人类消息会在接话前交付给其他成员。</small></>}
     <h4>平等讨论规则 · 所有成员生效</h4><p className="field-help">先独立判断，再有依据地赞同、反对或保留意见。改变立场要说明新依据；不先恭维、不列服务菜单，也不为了显得独立而强行唱反调。原生模式同样遵守这些规则，人设仍由你单独设置。</p>
     <label className="free-checkbox"><input type="checkbox" checked={free.allowStickers??true} onChange={e=>setFree({...free,allowStickers:e.target.checked})}/>允许 AI 从本地表情库选择表情</label>
     {number('AI 表情包间隔（秒）','stickerCooldownSeconds',0,600)}

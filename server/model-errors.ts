@@ -13,18 +13,42 @@ export class ProviderRequestError extends ModelCallError {
   constructor(message: string, readonly kind: FailureKind, readonly status: number, readonly notGenerated: boolean, readonly retryAfterMs?: number) { super(message); }
 }
 
+// Ark error codes: https://docs.volcengine.com/docs/ark/error-codes?lang=zh
+// Only fixed known codes and our own explanations enter logs, never upstream messages/account IDs.
+const arkRateLimits:Record<string,string>={
+  'RateLimitExceeded.EndpointRPMExceeded':'接入点每分钟请求数（RPM）',
+  'RateLimitExceeded.EndpointTPMExceeded':'接入点每分钟 Token 数（TPM）',
+  'RateLimitExceeded.EndpointFlexTPMExceeded':'接入点 Flex Token 速率',
+  ModelAccountRpmRateLimitExceeded:'账号当前模型的每分钟请求数（RPM）',
+  ModelAccountTpmRateLimitExceeded:'账号当前模型的每分钟 Token 数（TPM）',
+  ModelAccountFlexTpmRateLimitExceeded:'账号当前模型的 Flex Token 速率',
+  APIAccountRpmRateLimitExceeded:'账号当前接口的每分钟请求数（RPM）',
+  ModelAccountIpmRateLimitExceeded:'账号当前模型的每分钟图片数（IPM）',
+  InflightBatchsizeExceeded:'并发请求数',
+  AccountRateLimitExceeded:'账号请求或 Token 速率',
+  RequestBurstTooFast:'突发流量保护',
+  ServerOverloaded:'服务负载保护',
+};
+
 /** Return only recognized categories, never upstream messages, IDs, URLs or account information. */
 export function classifyProviderFailure(status: number, payload: unknown, provider: ProviderId, retryAfter?: string | null, now = Date.now()): ProviderRequestError {
   const raw = payload && typeof payload === 'object' ? (payload as any).error : undefined;
   const code = typeof raw?.code === 'string' ? raw.code : '';
   const type = typeof raw?.type === 'string' ? raw.type : '';
-  const label = provider === 'openai' ? 'OpenAI API' : '模型服务';
+  const label = provider === 'openai' ? 'OpenAI API' : provider === 'doubao' ? '豆包 · 火山方舟' : '模型服务';
+  const delay = parseRetryAfter(retryAfter, now);
+  if(provider==='doubao'&&status===429){
+    if(code==='SetLimitExceeded')return new ProviderRequestError(`${label} 已达到供应商侧设置的模型或接入点用量上限（HTTP 429 / SetLimitExceeded），推理服务已暂停。请在火山方舟控制台的「开通管理」检查模型用量上限及「安心体验模式」；使用接入点时也检查接入点用量上限。这不是茶馆的 Token 上限，也不代表 API Key 失效；调整前请确认可接受的费用。本程序不会自动重试或修改供应商限额。`,'quota',status,true);
+    if(code==='ModelAccountTpdRateLimitExceeded')return new ProviderRequestError(`${label} 当前模型的每日 Token 配额已达到上限（HTTP 429 / ModelAccountTpdRateLimitExceeded）。请等待供应商配额重置或在控制台申请调整；本程序不会短间隔自动重试。`,'quota',status,true);
+    if(code==='QuotaExceeded.AgentPlanQuotaExceeded')return new ProviderRequestError(`${label} Agent Plan 套餐额度已耗尽（HTTP 429 / QuotaExceeded.AgentPlanQuotaExceeded）。请在供应商控制台检查套餐额度；本程序不会自动重试。`,'quota',status,true);
+    if(code==='QuotaExceeded'||code==='AccountQuotaExceeded')return new ProviderRequestError(`${label} 额度或任务配额受限（HTTP 429 / ${code}）。该错误码可能涉及试用/套餐额度或排队任务配额，不能仅据此判定现金余额耗尽；请在火山方舟控制台核对当前模型服务、套餐及任务配额。本程序不会自动重试。`,'quota',status,true);
+    if(Object.hasOwn(arkRateLimits,code))return new ProviderRequestError(`${label} 触发${arkRateLimits[code]}限制（HTTP 429 / ${code}）。${delay!==undefined?`至少等待 ${Math.ceil(delay/1000)} 秒后再试。`:'请降低并发与发送频率，稍后再试。'}这不代表密钥失效或现金余额耗尽。`,'rate_limit',status,true,delay);
+  }
   const quotaCodes = ['insufficient_quota', 'credit_balance_exhausted', 'organization_spend_limit_exceeded', 'organization_usage_limit_exceeded', 'project_spend_limit_exceeded', 'billing_hard_limit_reached'];
   if (status === 429 && (quotaCodes.includes(code) || type === 'insufficient_quota')) {
     const detail = code === 'credit_balance_exhausted' ? '预付余额已耗尽' : code === 'organization_spend_limit_exceeded' || code === 'project_spend_limit_exceeded' ? '已达到组织或项目支出上限' : code === 'organization_usage_limit_exceeded' ? '已达到组织的 API 使用额度上限' : '可用额度不足或已达到账单上限';
     return new ProviderRequestError(`${label} ${detail}（HTTP 429）。请在供应商 API 账单与限额中处理后再继续；更换模型名称不能补足额度，本程序不会自动重试。${provider === 'openai' ? 'ChatGPT 订阅与 API 余额分别计费。' : ''}`, 'quota', status, true);
   }
-  const delay = parseRetryAfter(retryAfter, now);
   if (status === 429 && (['rate_limit_exceeded', 'slow_down'].includes(code) || type === 'rate_limit_error')) {
     return new ProviderRequestError(`${label} 暂时达到请求或 Token 速率限制（HTTP 429）。${delay !== undefined ? `至少等待 ${Math.ceil(delay / 1000)} 秒后再试。` : '请降低并发与唤醒频率，稍后再试。'}这不等于密钥无效或余额耗尽。`, 'rate_limit', status, true, delay);
   }

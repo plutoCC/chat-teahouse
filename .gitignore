@@ -2,6 +2,9 @@ node_modules/
 .npm-cache/
 dist/
 data/
+data-hosted/
+hosting-process.lock
+hosting-mode.json
 .env*
 !.env.example
 *.log
@@ -45,6 +48,7 @@ Thumbs.db
 # Public documentation is explicitly allowlisted below.
 docs/*
 !docs/DEPLOYMENT.md
+!docs/HOSTING.md
 !docs/USER-GUIDE.md
 !docs/ARCHITECTURE.md
 !docs/TESTING.md

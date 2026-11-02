@@ -19,6 +19,49 @@ function frame(value: unknown) { return `data: ${JSON.stringify(value)}\r\n\r\n`
 async function withFetch(fn: typeof fetch, action: () => Promise<void>) { const original = globalThis.fetch; globalThis.fetch = fn; try { await action(); } finally { globalThis.fetch = original; } }
 const humanMessage = (): Message => ({ id: 'human-1', groupId: 'group-1', author: '人类讨论者', avatar: '我', color: '#fff', kind: 'user', content: '我认为这个前提不成立，请一起检查证据。', reasoning: '', reasoningLabel: '', round: 1, status: 'complete', createdAt: new Date().toISOString(), inputMessageIds: [], inputTokens: 0, outputTokens: 0 });
 
+test('round requests forward configured output above the old application caps unchanged',async()=>{
+  let calls=0;
+  await withFetch(async(_url,init)=>{
+    calls++;assert.equal(JSON.parse(String(init?.body)).max_tokens,65536);
+    return streaming(frame({choices:[{delta:{content:'模拟回复'},finish_reason:'stop'}],usage:{prompt_tokens:10,completion_tokens:3}})+'data: [DONE]\n\n');
+  },async()=>{
+    const result=await complete(request('deepseek',{maxOutputTokens:65536}).value);
+    assert.equal(result.outputTokens,3);assert.equal(calls,1);
+  });
+});
+
+test('streaming replies flag fallback usage for every provider without altering local counters',async()=>{
+  for(const id of ['openai','claude','deepseek','qwen','doubao','ollama'] as const){
+    const content=(usage:any)=>id==='openai'?frame({type:'response.output_text.delta',delta:'演示观点'})+frame({type:'response.completed',response:{usage}}):id==='claude'?[
+      {type:'message_start',message:{usage}},
+      {type:'content_block_delta',delta:{type:'text_delta',text:'演示观点'}},
+      {type:'message_delta',delta:{stop_reason:'end_turn'},usage:usage?{output_tokens:usage.output_tokens}:undefined},
+      {type:'message_stop'},
+    ].map(frame).join(''):id==='ollama'?JSON.stringify({message:{content:'演示观点'},done:true,prompt_eval_count:usage?.input_tokens,eval_count:usage?.output_tokens})+'\n':frame({choices:[{delta:{content:'演示观点'},finish_reason:'stop'}],usage})+'data: [DONE]\n\n';
+    const keys=['openai','claude','ollama'].includes(id)?['input_tokens','output_tokens']:['prompt_tokens','completion_tokens'];
+    for(const usage of [undefined,{}, {[keys[0]]:12}, {[keys[1]]:8}, {[keys[0]]:-1,[keys[1]]:8}, {[keys[0]]:12,[keys[1]]:'8'}, {[keys[0]]:12,[keys[1]]:0.5}, {[keys[0]]:12,[keys[1]]:1e12}]){
+      await withFetch(async()=>streaming(content(usage)),async()=>{
+        const result=await complete(request(id).value);assert.equal(result.usageEstimated,true,id);assert.ok(result.inputTokens>=0);assert.ok(result.outputTokens>=0);
+      });
+    }
+    await withFetch(async()=>streaming(content(undefined)),async()=>{
+      const r=request(id).value,result=await complete(r);assert.equal(result.inputTokens,estimateInputTokens(r));assert.equal(result.outputTokens,r.maxOutputTokens);
+    });
+    await withFetch(async()=>streaming(content({[keys[0]]:0,[keys[1]]:0})),async()=>{assert.deepEqual(await complete(request(id).value),{inputTokens:0,outputTokens:0});});
+  }
+});
+
+test('Claude missing final output usage and malformed cache usage remain uncertain',async()=>{
+  for(const cache of [undefined,null,'7',-1,0.5]){
+    await withFetch(async()=>streaming([
+      {type:'message_start',message:{usage:{input_tokens:20,output_tokens:1,...(cache===undefined?{}:{cache_read_input_tokens:cache})}}},
+      {type:'content_block_delta',delta:{type:'text_delta',text:'演示观点'}},
+      {type:'message_delta',delta:{stop_reason:'end_turn'},...(cache===undefined?{}:{usage:{output_tokens:9}})},
+      {type:'message_stop'},
+    ].map(frame).join('')),async()=>{const result=await complete(request('claude').value);assert.equal(result.usageEstimated,true);assert.equal(result.inputTokens,20);});
+  }
+});
+
 test('round and connection checks preserve safe quota diagnostics without retrying or echoing raw errors',async()=>{
   let calls=0;
   await withFetch(async()=>{calls++;return new Response(JSON.stringify({error:{code:'credit_balance_exhausted',type:'insufficient_quota',message:'private-account-id'}}),{status:429});},async()=>{

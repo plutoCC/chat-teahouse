@@ -1,4 +1,6 @@
 export interface FreeChatSettings {
+  publicSummary?: {connectionId:string;model:string};
+  summaryTimeoutSeconds?: number;
   messageStyle?: 'segmented' | 'single';
   messageGapMin?: number;
   messageGapMax?: number;
@@ -11,7 +13,9 @@ export interface FreeChatSettings {
   cooldownMin: number;
   cooldownMax: number;
   concurrency: number;
-  maxMinutes: number;
+  /** Legacy saved setting; no longer enforced. */
+  maxMinutes?: number;
+  maxModelCallsPerWake?: number;
   wakeProbability: number;
   respondToAI: boolean;
 }
@@ -20,10 +24,11 @@ export const defaultFreeSettings: FreeChatSettings = {
   waitForUserDraft:false,
   allowStickers:true, stickerCooldownSeconds:60,
   quietSeconds: 1, cooldownMin: 2, cooldownMax: 5,
-  concurrency: 2, maxMinutes: 30, wakeProbability: 1, respondToAI: true,
+  concurrency: 2, maxModelCallsPerWake: 8, wakeProbability: 1, respondToAI: true,
 };
 export type MemberActivity = 'listening' | 'queued' | 'sending' | 'thinking' | 'waiting' | 'retrying' | 'budget_wait' | 'error' | 'paused';
 export interface FreeMemberState {
+  manualWake?: boolean;
   id: string;
   sessionId: string;
   fingerprint: string;
@@ -51,7 +56,9 @@ export interface FreeSession {
   status: 'active' | 'paused' | 'interrupted' | 'limit';
   epoch: number;
   createdAt: string;
-  deadline: number;
+  /** Legacy saved deadline; no longer enforced. */
+  deadline?: number;
+  pauseRequested?: {memberId:string};
   updatedAt: string;
   callCount: number;
   publishedCount: number;
@@ -68,3 +75,8 @@ export interface FreeSession {
 export interface RoomEvent { seq: number; messageId: string; participantId?: string; createdAt: number; }
 export interface SkillDefinition { id: string; name: string; description: string; instructions: string; builtin: boolean; }
 export interface SkillSummary { id: string; name: string; description: string; builtin: boolean; }
+
+/** Older sessions stopped by the removed timer can continue with their existing budget. */
+export function isLegacyTimeLimit(session:FreeSession):boolean {
+  return session.status==='limit'&&session.error==='达到本场自动讨论时限。';
+}

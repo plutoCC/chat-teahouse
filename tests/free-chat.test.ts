@@ -18,7 +18,7 @@ function fixture(t:TestContext,run?:(wake:RuntimeWake)=>Promise<void>,native?:Na
   const root=resolve('.test-artifacts');mkdirSync(root,{recursive:true});const dir=mkdtempSync(join(root,'free-chat-'));
   const store=new Store(dir);store.seed([cloud]);seedSkills(store);const group=store.groups()[0];
   group.participants=group.participants.slice(0,2).map((p,i)=>({...p,providerId:'openai' as const,model:`test-${i}`,name:`成员 ${i}`}));
-  group.freeSettings={messageGapMin:0,messageGapMax:0,readingCharsPerSecond:0,typingGraceSeconds:0,quietSeconds:0,cooldownMin:0,cooldownMax:0,concurrency:2,maxMinutes:5,wakeProbability:1,respondToAI:true};
+  group.freeSettings={messageGapMin:0,messageGapMax:0,readingCharsPerSecond:0,typingGraceSeconds:0,quietSeconds:0,cooldownMin:0,cooldownMax:0,concurrency:2,maxMinutes:5,publicSummary:{connectionId:'openai',model:'neutral-summarizer'},wakeProbability:1,respondToAI:true};
   group.settings={...group.settings,budgetUSD:0,maxCalls:30,maxTotalTokens:1000000};store.saveGroup(group);
   const runtime:ParticipantRuntime=run?{run,shutdown:async()=>{}}:new HarnessRuntime(dir,native);
   const engine=new RoomEngine(store,{runtime,providers:()=>[cloud],getKey:()=> 'fixture-key',notify:()=>{},random:()=>0.5,...timing});
@@ -26,7 +26,237 @@ function fixture(t:TestContext,run?:(wake:RuntimeWake)=>Promise<void>,native?:Na
   const human=(content='补充条件')=>{const msg:Message={id:crypto.randomUUID(),groupId:group.id,author:'我',avatar:'我',color:'#000000',kind:'user',content,reasoning:'',reasoningLabel:'',round:0,status:'complete',createdAt:new Date().toISOString(),inputMessageIds:[],inputTokens:0,outputTokens:0};store.saveMessage(msg);engine.messageArrived(group.id);return msg;};
   return {engine,store,group,human,dir};
 }
-const tool=(name:string,args:object,id=crypto.randomUUID())=>({blocks:[{type:'tool-call' as const,id:ToolCallId(id),name,arguments:JSON.stringify(args)}],inputTokens:10,outputTokens:10});
+const tool=(name:string,args:object,id:string=crypto.randomUUID())=>({blocks:[{type:'tool-call' as const,id:ToolCallId(id),name,arguments:JSON.stringify(args)}],inputTokens:10,outputTokens:10});
+
+test('a standby mention received during graceful pause runs after the final bubble without resuming peers',async t=>{
+  let single=0;const f=fixture(t,async w=>{w.read(20);if(w.singleResponse){single++;await w.post('暂停后的单次总结',undefined,'single-after-drain');}else await w.post('第一段\n\n第二段',undefined,'drain-before-mention');});
+  f.group.participants[1].enabled=false;f.group.freeSettings!.messageStyle='segmented';f.store.saveGroup(f.group);
+  f.engine.start(f.group.id);await waitUntil(()=>f.store.messages(f.group.id).some(m=>m.content==='第一段'));
+  f.engine.pause(f.group.id);const p=f.group.participants[1],m=f.human('@'+p.name+' 总结');m.mentions=[p.id];f.store.saveMessage(m);f.engine.messageArrived(f.group.id,m);
+  await waitUntil(()=>f.store.messages(f.group.id).some(m=>m.content==='暂停后的单次总结'));await f.engine.settle(f.group.id);
+  assert.equal(single,1);assert.equal(f.store.freeSession(f.group.id)!.status,'paused');assert.equal(f.store.messages(f.group.id).filter(m=>m.kind==='assistant').length,3);
+});
+
+test('an idle standby seat does not prevent a failed automatic discussion from pausing',async t=>{
+  const f=fixture(t,async()=>{throw new Error('fixture failure');});f.group.participants[1].enabled=false;f.store.saveGroup(f.group);
+  f.engine.start(f.group.id);await waitUntil(()=>f.store.freeSession(f.group.id)!.status==='paused');
+  assert.equal(f.store.freeSession(f.group.id)!.members[0].status,'error');
+});
+
+test('human mentions wake a standby member once while the room remains paused, keeping private context and shared budgets',async t=>{
+  const calls:string[]=[];
+  const f=fixture(t,async w=>{assert.equal(w.singleResponse,true);calls.push(w.sessionId);w.read(20);const ticket=w.reserve(10,10);w.settle(ticket,{inputTokens:10,outputTokens:10});await w.post('本次总结',undefined,crypto.randomUUID());});
+  f.group.participants[0].enabled=false;f.store.saveGroup(f.group);const member=f.group.participants[0];
+  const mention=()=>{const m=f.human('@'+member.name+' 总结一下');m.mentions=[member.id];f.store.saveMessage(m);f.engine.messageArrived(f.group.id,m);};
+  mention();await waitUntil(()=>f.store.messages(f.group.id).some(m=>m.content==='本次总结'));await f.engine.settle(f.group.id);
+  const first=f.store.freeSession(f.group.id)!;assert.equal(first.status,'paused');assert.equal(first.callCount,1);assert.equal(first.members.find(m=>m.id===member.id)!.manualWake,undefined);assert.equal(f.store.group(f.group.id)!.participants[0].enabled,false);
+  f.human('普通补充');f.engine.pump(f.group.id);await new Promise(r=>setTimeout(r,20));assert.equal(calls.length,1);
+  mention();await waitUntil(()=>calls.length===2);await f.engine.settle(f.group.id);assert.equal(calls[0],calls[1]);assert.equal(f.store.freeSession(f.group.id)!.status,'paused');assert.equal(f.store.freeSession(f.group.id)!.callCount,2);
+  assert.ok(f.store.logs(f.group.id).some(l=>l.summary.includes('单次唤醒')));
+});
+
+test('standby ignores ordinary and AI messages during discussion, and a manual timer cannot turn into automatic participation',async t=>{
+  let standby=0;const f=fixture(t,async w=>{w.read(20);if(!w.participant.enabled){standby++;assert.equal(w.singleResponse,true);w.wait(1);}else w.wait(0);});
+  f.group.participants[1].enabled=false;f.store.saveGroup(f.group);const p=f.group.participants[1];f.engine.start(f.group.id);await f.engine.settle(f.group.id);await new Promise(r=>setTimeout(r,30));assert.equal(standby,0);
+  const m=f.human('@'+p.name+' 扩展一下');m.mentions=[p.id];f.store.saveMessage(m);f.engine.messageArrived(f.group.id,m);await waitUntil(()=>standby===1);await f.engine.settle(f.group.id);
+  assert.equal(f.store.freeSession(f.group.id)!.members.find(m=>m.id===p.id)!.wakeAt,undefined);
+  const ai={...m,id:crypto.randomUUID(),kind:'assistant' as const,participantId:f.group.participants[0].id};f.store.saveMessage(ai);f.engine.messageArrived(f.group.id,ai);f.engine.pump(f.group.id);await new Promise(r=>setTimeout(r,30));assert.equal(standby,1);
+});
+
+test('a repeated mention while already awake is coalesced, and stopping cancels a paused-room wake',async t=>{
+  let calls=0,release!:()=>void;const held=new Promise<void>(r=>release=r);
+  const f=fixture(t,async w=>{calls++;await held;w.assertActive();w.read(20);await w.post('不能在停止后发送',undefined,'cancelled');});
+  const p=f.group.participants[0];p.enabled=false;f.store.saveGroup(f.group);
+  const mention=()=>{const m=f.human('@'+p.name+' 请求');m.mentions=[p.id];f.store.saveMessage(m);f.engine.messageArrived(f.group.id,m);};
+  mention();await waitUntil(()=>calls===1);mention();f.engine.pump(f.group.id);assert.equal(calls,1);
+  f.engine.pause(f.group.id);release();await f.engine.settle(f.group.id);assert.equal(f.store.messages(f.group.id).some(m=>m.content==='不能在停止后发送'),false);assert.equal(f.store.freeSession(f.group.id)!.status,'paused');assert.equal(f.engine.busy(f.group.id),false);
+});
+
+test('manual wakes respect exhausted budgets and cannot implicitly reset a discussion allowance',async t=>{
+  let generated=0;const f=fixture(t,async w=>{w.read(20);const ticket=w.reserve(10,10);generated++;w.settle(ticket,{inputTokens:10,outputTokens:10});w.wait(15);});
+  const p=f.group.participants[0];p.enabled=false;f.group.settings.maxCalls=1;f.store.saveGroup(f.group);
+  const mention=()=>{const m=f.human('@'+p.name+' 任务');m.mentions=[p.id];f.store.saveMessage(m);f.engine.messageArrived(f.group.id,m);};
+  mention();await waitUntil(()=>generated===1);await f.engine.settle(f.group.id);mention();await waitUntil(()=>f.store.freeSession(f.group.id)?.members[0].status==='error');await f.engine.settle(f.group.id);
+  assert.equal(generated,1);assert.equal(f.store.freeSession(f.group.id)!.callCount,1);assert.match(f.store.freeSession(f.group.id)!.members[0].error!,/调用次数上限/);
+});
+
+test('playback presence blocks wakes, releases immediately, ignores stale packets and expires when a browser disappears',async t=>{
+  let now=1000,calls=0;const f=fixture(t,async wake=>{calls++;wake.read(20);wake.wait(0);},undefined,{now:()=>now});
+  const id=f.group.id,clientId=crypto.randomUUID();
+  f.engine.playbackPresence(id,{clientId,sequence:1,active:true});
+  f.engine.start(id);f.engine.pump(id);assert.equal(calls,0);
+  f.engine.playbackPresence(id,{clientId,sequence:3,active:false});
+  f.engine.playbackPresence(id,{clientId,sequence:2,active:true});
+  f.engine.pump(id);await waitUntil(()=>calls>0);f.engine.pause(id);
+  await new Promise(r=>setTimeout(r,20));const previous=calls;
+  f.engine.playbackPresence(id,{clientId,sequence:4,active:true});now+=90001;
+  f.engine.start(id);f.engine.pump(id);await waitUntil(()=>calls>previous);
+});
+
+test('playback holds an already prepared publication without losing its content',async t=>{
+  let ready!:()=>void;const pending=new Promise<void>(r=>ready=r);let received=false;
+  const f=fixture(t,async wake=>{wake.read(20);await pending;await wake.post('应当等朗读完成后发布',undefined,'playback-call');received=true;});
+  f.group.participants=f.group.participants.slice(0,1);f.store.saveGroup(f.group);
+  f.engine.start(f.group.id);await new Promise(r=>setTimeout(r,20));
+  const clientId=crypto.randomUUID();f.engine.playbackPresence(f.group.id,{clientId,sequence:1,active:true});ready();
+  await new Promise(r=>setTimeout(r,30));assert.equal(received,false);
+  f.engine.playbackPresence(f.group.id,{clientId,sequence:2,active:false});await waitUntil(()=>received);
+  assert.ok(f.store.messages(f.group.id).some(m=>m.content==='应当等朗读完成后发布'));
+});
+
+test('99 unread messages reach the first inference together and can publish with a two-call wake limit',async t=>{
+  let calls=0;const f=fixture(t,undefined,async options=>{
+    calls++;
+    const delivery=JSON.parse((options.messages.at(-1)!.content[0] as {text:string}).text);
+    assert.equal(delivery.messages.length,99);assert.equal(delivery.more,false);
+    assert.equal(delivery.messages[98].content,'观点 98');
+    return tool('post_message',{content:'这些讨论材料已经齐全，我认为需要先验证关键假设。',replyTo:delivery.messages[98].id});
+  });
+  f.group.participants=f.group.participants.slice(0,1);f.group.freeSettings={...f.group.freeSettings!,maxModelCallsPerWake:2,messageStyle:'single'};f.store.saveGroup(f.group);
+  for(let i=0;i<99;i++)f.human(`观点 ${i}`);
+  f.engine.start(f.group.id);await waitUntil(()=>calls>0);await f.engine.settle(f.group.id);
+  assert.equal(calls,1);assert.equal(f.store.messages(f.group.id).length,100);assert.equal(f.store.freeSession(f.group.id)!.members[0].error,undefined);
+  assert.equal(f.store.messages(f.group.id).at(-1)!.inputMessageIds.length,99);
+});
+
+test('large initial backlog is summarized without consuming the discussion-call allowance',async t=>{
+  let summaries=0,discussion=0;const f=fixture(t,undefined,async options=>{
+    if(!options.tools){summaries++;return {blocks:[{type:'text',text:'较早的群友观点仍存在分歧，应验证证据。'}],inputTokens:100,outputTokens:20};}
+    discussion++;const delivery=JSON.parse((options.messages.at(-1)!.content[0] as {text:string}).text);
+    assert.ok(delivery.historySummary);assert.equal(delivery.messages.length,20);assert.equal(delivery.more,false);
+    return tool('post_message',{content:'我认为先对关键假设做一次验证，再决定采用哪个方案。'});
+  });
+  f.group.participants=f.group.participants.slice(0,1);f.group.freeSettings={...f.group.freeSettings!,maxModelCallsPerWake:2,messageStyle:'single'};f.store.saveGroup(f.group);
+  for(let i=0;i<100;i++)f.human(`观点 ${i}:`+'议'.repeat(1400));
+  f.engine.start(f.group.id);await waitUntil(()=>summaries>0);await f.engine.settle(f.group.id);
+  assert.ok(summaries>=2);assert.equal(discussion,1);assert.equal(f.store.freeSession(f.group.id)!.callCount,summaries+1);assert.equal(f.store.freeSession(f.group.id)!.members[0].error,undefined);
+  assert.equal(f.store.messages(f.group.id).length,101);
+});
+
+test('two empty reads stop unproductive inference while the configured limit governs other tool work',async t=>{
+  let calls=0;const f=fixture(t,undefined,async()=>{calls++;return tool('read_messages',{});});
+  f.group.participants=f.group.participants.slice(0,1);f.store.saveGroup(f.group);f.engine.start(f.group.id);await waitUntil(()=>calls>0);await f.engine.settle(f.group.id);
+  assert.equal(calls,2);assert.match(f.store.freeSession(f.group.id)!.members[0].error!,/连续两次读取均没有新消息/);
+  let steps=0;const g=fixture(t,undefined,async()=>{steps++;return tool('set_attention',{mode:'all'});});
+  g.group.participants=g.group.participants.slice(0,1);g.group.freeSettings={...g.group.freeSettings!,maxModelCallsPerWake:6};g.store.saveGroup(g.group);g.engine.start(g.group.id);await waitUntil(()=>steps>0);await g.engine.settle(g.group.id);
+  assert.equal(steps,6);assert.match(g.store.freeSession(g.group.id)!.members[0].error!,/6 次讨论模型调用保护上限/);
+});
+
+test('two real Harness members share the selected tool model and summary usage has its own ledger identity',async t=>{
+  let summaries=0,decisions=0;
+  const f=fixture(t,undefined,async(options,provider)=>{
+    if(!options.tools){
+      summaries++;assert.equal(provider.model,'neutral-summarizer');assert.equal(options.model,'neutral-summarizer');assert.match(options.system!,/不是群聊成员/);assert.doesNotMatch(JSON.stringify(options.messages),/PRIVATE_PERSONA|PRIVATE_SKILL/);
+      return {blocks:[{type:'text',text:'公开议题存在分歧，尚需验证。'}],inputTokens:100,outputTokens:20};
+    }
+    decisions++;assert.notEqual(provider.model,'neutral-summarizer');assert.match(JSON.stringify(options.messages),/historySummary/);
+    return tool('wait_for_messages',{seconds:0});
+  });
+  f.group.participants=f.group.participants.map(p=>({...p,role:'PRIVATE_PERSONA',identityMode:'role'}));f.store.saveGroup(f.group);
+  for(let i=0;i<100;i++)f.human(`公开观点-${i}:`+'议'.repeat(1400));
+  f.engine.start(f.group.id);await waitUntil(()=>decisions===2);await f.engine.settle(f.group.id);
+  assert.equal(summaries,3);assert.equal(decisions,2);assert.equal(f.store.messages(f.group.id).length,100);
+  const usage=f.store.memberUsage(f.group.id).members,shared=usage.find(u=>u.memberId==='public-summary')!;
+  assert.equal(shared.author,'公共摘要');assert.equal(shared.model,'neutral-summarizer');assert.equal(shared.calls,summaries);assert.equal(shared.inputTokens,300);assert.equal(shared.outputTokens,60);assert.equal(shared.estimatedUSD,360/1e6);
+  assert.ok(usage.filter(u=>u.memberId!=='public-summary').every(u=>u.calls===1));assert.equal(f.store.freeSession(f.group.id)!.callCount,summaries+decisions);
+  assert.ok(f.store.logs(f.group.id).some(l=>l.author==='公共摘要'&&l.summary.includes('仅整理公开消息')));
+});
+
+test('missing public summary selection pauses compression without silently billing any member model',async t=>{
+  let calls=0;const f=fixture(t,undefined,async()=>{calls++;return tool('wait_for_messages',{seconds:0});});
+  delete f.group.freeSettings!.publicSummary;f.store.saveGroup(f.group);for(let i=0;i<100;i++)f.human('议'.repeat(1000));
+  f.engine.start(f.group.id);await waitUntil(()=>f.store.freeSession(f.group.id)!.status==='paused');await f.engine.settle(f.group.id);
+  assert.equal(calls,0);assert.ok(f.store.freeSession(f.group.id)!.members.every(m=>m.error?.includes('公共摘要连接')));assert.equal(f.store.freeSession(f.group.id)!.callCount,0);
+});
+
+test('failed backlog summarization leaves public history unacknowledged and performs no discussion call',async t=>{
+  let calls=0;const f=fixture(t,undefined,async options=>{calls++;assert.equal(options.tools,undefined);return {blocks:[],inputTokens:20,outputTokens:10};});
+  f.group.participants=f.group.participants.slice(0,1);f.store.saveGroup(f.group);
+  for(let i=0;i<100;i++)f.human('公开记录 '+i+'议'.repeat(600));
+  f.engine.start(f.group.id);await waitUntil(()=>calls>0);await f.engine.settle(f.group.id);
+  assert.equal(calls,1);const session=f.store.freeSession(f.group.id)!;
+  assert.match(session.members[0].error!,/摘要为空/);assert.equal(session.members[0].acknowledgedSeq,0);
+  assert.equal(f.store.messages(f.group.id).length,100);assert.equal(session.callCount,1);assert.equal(session.reservedTokens,0);
+});
+
+test('renewing a budget-exhausted discussion preserves private identity and read cursor while resetting only the scene budget',async t=>{
+  let now=Date.now(),calls=0;
+  const f=fixture(t,undefined,async options=>{
+    if(++calls===2)assert.ok(options.messages.some(m=>m.role==='assistant'&&m.content.some(b=>b.type==='tool-call'&&b.name==='wait_for_messages')),'renew keeps prior private decisions');
+    return tool('wait_for_messages',{seconds:0,reason:'等待补充'});
+  },{now:()=>now});
+  f.group.participants=f.group.participants.slice(0,1);f.group.settings.maxCalls=1;f.store.saveGroup(f.group);f.human('先讨论验证方法');now=Date.now()+1000;
+  f.engine.start(f.group.id);await waitUntil(()=>calls===1);await f.engine.settle(f.group.id);f.engine.pause(f.group.id);
+  f.store.mutateFree(f.group.id,s=>{s.status='limit';});const old=f.store.freeSession(f.group.id)!;now+=86400000;
+  assert.throws(()=>f.engine.start(f.group.id),/保留上下文/);assert.throws(()=>f.engine.start(f.group.id,true,true),/不能同时/);
+  const renewed=f.engine.start(f.group.id,false,true);
+  assert.notEqual(renewed.id,old.id);assert.equal(renewed.members[0].sessionId,old.members[0].sessionId);assert.equal(renewed.members[0].acknowledgedSeq,old.members[0].acknowledgedSeq);
+  assert.equal(renewed.callCount,0);assert.equal(renewed.inputTokens,0);assert.equal(renewed.deadline,undefined);
+  await waitUntil(()=>calls===2);await f.engine.settle(f.group.id);
+  assert.equal(f.store.memberUsage(f.group.id).members[0].calls,2);assert.equal(f.store.messages(f.group.id).length,1);
+});
+
+test('legacy deadlines do not stop running or resumed discussions and do not reset budgets or private identity',async t=>{
+  let now=Date.now(),calls=0;
+  const f=fixture(t,async w=>{calls++;w.read();const ticket=w.reserve(10,20);w.settle(ticket,{inputTokens:10,outputTokens:5});w.wait(0);},undefined,{now:()=>now});
+  f.group.participants=f.group.participants.slice(0,1);f.store.saveGroup(f.group);
+  f.engine.start(f.group.id);await waitUntil(()=>calls===1);await f.engine.settle(f.group.id);
+  const original=f.store.freeSession(f.group.id)!;assert.equal(original.deadline,undefined);
+  f.store.mutateFree(f.group.id,s=>{s.deadline=now+1;});now+=365*86400000;
+  f.human('很久以后再继续');f.engine.pump(f.group.id);await f.engine.settle(f.group.id);
+  assert.equal(calls,2);assert.equal(f.store.freeSession(f.group.id)!.status,'active');
+  f.engine.pause(f.group.id);
+  f.store.mutateFree(f.group.id,s=>{s.status='limit';s.error='达到本场自动讨论时限。';});
+  const resumed=f.engine.start(f.group.id);
+  assert.equal(resumed.id,original.id);assert.equal(resumed.members[0].sessionId,original.members[0].sessionId);
+  assert.equal(resumed.callCount,2);assert.equal(resumed.inputTokens,20);assert.equal(resumed.deadline,undefined);
+  await f.engine.settle(f.group.id);
+});
+
+test('graceful pause finishes only the current speech, cancels queued peers and blocks additional calls',async t=>{
+  let calls=0,peer:RuntimeWake|undefined;
+  const f=fixture(t,async w=>{
+    calls++;w.read();
+    if(w.participant.id==='bbb')peer=w;
+    await w.post(w.participant.id==='aaa'?'第一段。\n\n第二段。\n\n第三段。':'排队中的其他成员不应发言',undefined,`pause-${w.participant.id}`);
+    assert.throws(()=>w.reserve(1,1),/暂停/);
+  });
+  f.group.participants[0].id='aaa';f.group.participants[1].id='bbb';f.group.freeSettings!.messageStyle='segmented';f.store.saveGroup(f.group);
+  f.engine.start(f.group.id);await waitUntil(()=>!!peer&&f.store.messages(f.group.id).length===1);
+  const pausing=f.engine.pause(f.group.id);assert.equal(pausing.status,'active');assert.equal(pausing.pauseRequested?.memberId,'aaa');
+  assert.ok(peer!.signal.aborted);assert.equal(f.engine.pause(f.group.id).pauseRequested?.memberId,'aaa');
+  f.engine.messageArrived(f.group.id);f.engine.pump(f.group.id);assert.equal(calls,2);
+  await f.engine.settle(f.group.id);
+  const messages=f.store.messages(f.group.id);assert.equal(messages.length,3);assert.ok(messages.every(m=>m.participantId==='aaa'&&m.speech?.state==='complete'));
+  const paused=f.store.freeSession(f.group.id)!;assert.equal(paused.status,'paused');assert.equal(paused.pauseRequested,undefined);assert.equal(paused.sending,undefined);
+  assert.equal(calls,2);assert.equal(paused.callCount,0);assert.ok(paused.members.every(m=>m.status==='paused'));
+});
+
+test('graceful pause keeps draft protection and completes after draft is submitted',async t=>{
+  const f=fixture(t,async w=>{w.read();await w.post('第一段。\n\n第二段。',undefined,'draft-pause');});
+  f.group.participants=f.group.participants.slice(0,1);f.group.freeSettings={...f.group.freeSettings!,messageStyle:'segmented',waitForUserDraft:true};f.store.saveGroup(f.group);
+  f.engine.start(f.group.id);await waitUntil(()=>f.store.messages(f.group.id).length===1);
+  const clientId=crypto.randomUUID();f.engine.draftPresence(f.group.id,{clientId,sequence:1,hasDraft:true,reason:'edit'});f.engine.pause(f.group.id);
+  await waitUntil(()=>f.store.freeSession(f.group.id)!.members[0].activity==='等待用户完成输入（连发已暂缓）');
+  assert.equal(f.store.messages(f.group.id).length,1);assert.ok(f.store.freeSession(f.group.id)!.pauseRequested);
+  f.engine.draftPresence(f.group.id,{clientId,sequence:2,hasDraft:false,reason:'sent'});await f.engine.settle(f.group.id);
+  assert.equal(f.store.messages(f.group.id).length,2);assert.equal(f.store.freeSession(f.group.id)!.status,'paused');
+});
+
+test('Harness persists a complete terminal tool result before graceful pause and retains it on resume',async t=>{
+  let calls=0;
+  const f=fixture(t,undefined,async options=>{
+    if(++calls===1)return tool('post_message',{content:'第一段保留观点。\n\n第二段保留依据。'},'drain-harness');
+    const result=options.messages.find(m=>m.role==='tool'&&m.toolCallId==='drain-harness');
+    assert.ok(result&&result.role==='tool'&&!result.isError);assert.match(JSON.stringify(result.content),/messageIds/);
+    return tool('wait_for_messages',{seconds:0});
+  });
+  f.group.participants=f.group.participants.slice(0,1);f.group.freeSettings!.messageStyle='segmented';f.store.saveGroup(f.group);
+  f.engine.start(f.group.id);await waitUntil(()=>f.store.messages(f.group.id).length===1);f.engine.pause(f.group.id);await f.engine.settle(f.group.id);
+  assert.equal(calls,1);assert.equal(f.store.messages(f.group.id).length,2);assert.equal(f.store.freeSession(f.group.id)!.status,'paused');
+  f.engine.start(f.group.id);await waitUntil(()=>calls===2);await f.engine.settle(f.group.id);
+  assert.equal(f.store.freeSession(f.group.id)!.members[0].error,undefined);
+});
 
 test('draft waiting prevents new model admission until clearing plus three seconds, even beyond the old typing grace',async t=>{
   let now=Date.now(),calls=0;const f=fixture(t,async w=>{calls++;w.read();await w.post('输入完成之后再发言',undefined,'draft-admission');},undefined,{now:()=>now});
@@ -138,11 +368,11 @@ test('segmented reading pace follows the preceding bubble and leaves time for th
   f.engine.pause(f.group.id);await f.engine.settle(f.group.id);
 });
 
-test('pause immediately cancels the longer per-bubble reading delay',async t=>{
+test('service shutdown immediately cancels the longer per-bubble reading delay',async t=>{
   const f=fixture(t,async w=>{w.read();await w.post('甲'.repeat(100)+'\n\n剩余部分不应发出',undefined,'slow-reader');});
   f.group.participants=f.group.participants.slice(0,1);f.group.freeSettings={...f.group.freeSettings!,messageStyle:'segmented',readingCharsPerSecond:1};f.store.saveGroup(f.group);
   f.engine.start(f.group.id);await waitUntil(()=>f.store.messages(f.group.id).length===1);
-  const pausedAt=Date.now();f.engine.pause(f.group.id);await f.engine.settle(f.group.id);
+  const pausedAt=Date.now();await f.engine.shutdown();
   assert.ok(Date.now()-pausedAt<1000);assert.equal(f.store.messages(f.group.id).length,1);assert.equal(f.store.messages(f.group.id)[0].speech!.state,'interrupted');
 });
 
@@ -201,12 +431,12 @@ test('partially paginated peer speeches still require reading the rest before pu
   assert.equal(f.store.messages(f.group.id).length,5);assert.ok(f.store.logs(f.group.id).some(l=>l.kind==='protocol'&&l.summary.includes('尚未读完整')));
 });
 
-test('pause cancels unsent bubbles immediately, retains sent text and does not replay a duplicate tool call',async t=>{
+test('pause drains all bubbles, retains complete text and does not replay a duplicate tool call',async t=>{
   const f=fixture(t,async w=>{w.read();await w.post('已经发送的第一段。\n\n尚未发送的第二段。\n\n尚未发送的第三段。',undefined,'same-burst-id');});
   f.group.participants=f.group.participants.slice(0,1);f.group.freeSettings!.messageStyle='segmented';f.store.saveGroup(f.group);f.engine.start(f.group.id);
   await waitUntil(()=>f.store.messages(f.group.id).length===1);f.engine.pause(f.group.id);await f.engine.settle(f.group.id);
-  assert.equal(f.store.messages(f.group.id).length,1);assert.equal(f.store.messages(f.group.id)[0].speech!.state,'interrupted');assert.equal(f.store.freeSession(f.group.id)!.sending,undefined);
-  f.engine.start(f.group.id);await f.engine.settle(f.group.id);await new Promise(r=>setTimeout(r,1100));f.engine.pause(f.group.id);await f.engine.settle(f.group.id);assert.equal(f.store.messages(f.group.id).length,1);
+  assert.equal(f.store.messages(f.group.id).length,3);assert.ok(f.store.messages(f.group.id).every(m=>m.speech!.state==='complete'));assert.equal(f.store.freeSession(f.group.id)!.sending,undefined);assert.equal(f.store.freeSession(f.group.id)!.status,'paused');
+  f.engine.start(f.group.id);await f.engine.settle(f.group.id);await new Promise(r=>setTimeout(r,1100));f.engine.pause(f.group.id);await f.engine.settle(f.group.id);assert.equal(f.store.messages(f.group.id).length,3);
 });
 
 test('real Harness corrects empty praise once without forcing agreement or changing a substantiated opinion',async t=>{

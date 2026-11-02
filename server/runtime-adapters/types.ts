@@ -5,10 +5,12 @@ import type {LogInput} from '../../shared/room-journal.js';
 export interface Delivery {
   messages: {seq:number;id:string;author:string;participantId?:string;kind:string;content:string;senderKind?:'human'|'ai'|'import'|'system';replyTo?:string;sticker?:Pick<StickerAttachment,'id'|'name'|'tags'>;speech?:{id:string;index:number;total:number;state:string}}[];
   pendingSpeech?: {memberId:string};
+  historySummary?: {text:string;messageCount:number;fromSeq:number;throughSeq:number;notice:string};
   readThroughSeq: number;
   more: boolean;
 }
 export interface RuntimeWake {
+  singleResponse?: boolean;
   sessionId: string;
   group: Group;
   participant: Participant;
@@ -16,6 +18,9 @@ export interface RuntimeWake {
   apiKey?: string;
   signal: AbortSignal;
   firstWake: boolean;
+  publicHistory?():Delivery;
+  summaryWake?():RuntimeWake;
+  summaryCycle?:string;
   memberStates?: {id:string;status:MemberActivity}[];
   skills: SkillSummary[];
   assertActive(): void;

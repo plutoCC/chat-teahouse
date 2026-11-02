@@ -20,6 +20,8 @@
     "dev": "tsx server/index.ts",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts --production",
+    "host": "tsx server/hosting/index.ts",
+    "host:user": "tsx scripts/host-user.ts",
     "test": "tsx --test tests/*.test.ts",
     "check": "tsc --noEmit",
     "test:browser": "tsx --test tests/browser/*.test.ts",

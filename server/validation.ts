@@ -38,17 +38,17 @@ export const settingsSchema = z.object({
   contextMode: z.enum(['round', 'sequential']),
   order: z.enum(['fixed', 'random']),
   roundsMode: z.enum(['fixed', 'random']),
-  rounds: z.number().int().min(1).max(12),
-  roundsMin: z.number().int().min(1).max(12),
-  roundsMax: z.number().int().min(1).max(12),
+  rounds: z.number().int().min(1).max(10000),
+  roundsMin: z.number().int().min(1).max(10000),
+  roundsMax: z.number().int().min(1).max(10000),
   delayMode: z.enum(['fixed', 'random']),
   delaySeconds: z.number().min(0).max(300),
   delayMin: z.number().min(0).max(300),
   delayMax: z.number().min(0).max(300),
-  maxOutputTokens: z.number().int().min(128).max(8192),
-  maxCalls: z.number().int().min(1).max(128),
-  maxTotalTokens: z.number().int().min(1000).max(1_000_000),
-  budgetUSD: z.number().min(0).max(1000),
+  maxOutputTokens: z.number().int().min(128),
+  maxCalls: z.number().int().min(1).max(1000000),
+  maxTotalTokens: z.number().int().min(1000),
+  budgetUSD: z.number().min(0).max(10000000),
   autoSummary: z.boolean(),
   summaryParticipantId: z.union([z.literal(''), idSchema]),
 }).strict().superRefine((settings, ctx) => {
@@ -56,13 +56,15 @@ export const settingsSchema = z.object({
   if (settings.delayMin > settings.delayMax) ctx.addIssue({ code: 'custom', path: ['delayMax'], message: '最大间隔不能小于最小间隔' });
 });
 
-const participantsSchema = z.array(participantSchema).max(8).superRefine((participants, ctx) => {
+const participantsSchema = z.array(participantSchema).max(100).superRefine((participants, ctx) => {
   if (new Set(participants.map(p => p.id)).size !== participants.length) {
     ctx.addIssue({ code: 'custom', message: '成员 ID 不能重复' });
   }
 });
 
 export const freeSettingsSchema = z.object({
+  publicSummary:z.object({connectionId:idSchema,model:modelSchema}).strict().optional(),
+  summaryTimeoutSeconds:z.number().int().min(10).max(3600).optional(),
   messageStyle:z.enum(['segmented','single']).optional(),
   messageGapMin:z.number().min(0).max(300).optional(),
   messageGapMax:z.number().min(0).max(300).optional(),
@@ -74,12 +76,13 @@ export const freeSettingsSchema = z.object({
   quietSeconds: z.number().min(0).max(30),
   cooldownMin: z.number().min(1).max(300),
   cooldownMax: z.number().min(1).max(300),
-  concurrency: z.number().int().min(1).max(4),
-  maxMinutes: z.number().int().min(1).max(120),
+  concurrency: z.number().int().min(1).max(100),
+  maxMinutes: z.number().int().min(1).max(120).optional(), // Accept legacy clients/templates; ignored by scheduling.
+  maxModelCallsPerWake: z.number().int().min(1).max(256).optional(),
   wakeProbability: z.number().min(0).max(1),
   respondToAI: z.boolean(),
 }).strict().refine(s => s.cooldownMax >= s.cooldownMin, '最长冷却不能小于最短冷却').refine(s=>(s.messageGapMax??3)>=(s.messageGapMin??1),'最长发言间隔不能小于最短间隔');
-export const freeStartSchema = z.object({ reset: z.boolean().optional() }).strict();
+export const freeStartSchema = z.object({ reset: z.boolean().optional(),renew:z.boolean().optional() }).strict().refine(s=>!(s.reset&&s.renew),'不能同时重置和保留上下文续开');
 export const groupTemplateSchema = z.object({conversationMode:z.enum(['round','free']),settings:settingsSchema,freeSettings:freeSettingsSchema}).strict();
 export const skillImportSchema = z.object({ markdown: text(24000).min(1) }).strict();
 
@@ -87,7 +90,7 @@ export const createGroupSchema = z.object({
   name: shortText(80),
   goal: text(8000).default(''),
   participants: participantsSchema.optional(),
-  profileIds: z.array(idSchema).max(8).refine(ids=>new Set(ids).size===ids.length,'不能重复邀请同一成员').optional(),
+  profileIds: z.array(idSchema).max(100).refine(ids=>new Set(ids).size===ids.length,'不能重复邀请同一成员').optional(),
   settings: settingsSchema.optional(),
   conversationMode: z.enum(['round', 'free']).optional(),
   freeSettings: freeSettingsSchema.optional(),
@@ -105,7 +108,7 @@ export const patchGroupSchema = z.object({
 
 export const messageSchema = z.object({
   content: text(16_000).refine(value => value.trim().length > 0, '消息不能为空'),
-  mentions:z.array(idSchema).max(16).optional(),
+  mentions:z.array(idSchema).max(100).optional(),
 }).strict();
 
 export const runSchema = z.object({
@@ -126,6 +129,7 @@ export const providerUpdateSchema = z.object({
   enabled: z.boolean().optional(),
   region: z.enum(['cn', 'intl']).optional(),
   billingMode:z.enum(['api','subscription']).optional(),
+  sharedModels:z.array(modelSchema).max(100).refine(v=>new Set(v).size===v.length,'开放模型不能重复').optional(),
   modelPrices:z.record(modelSchema,z.object({inputPrice:z.number().min(0).max(10000),outputPrice:z.number().min(0).max(10000)}).strict()).refine(v=>Object.keys(v).length<=100,'最多配置 100 个模型价格').optional(),
   inputPrice: z.number().min(0).max(10_000).optional(),
   outputPrice: z.number().min(0).max(10_000).optional(),

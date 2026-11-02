@@ -5,7 +5,8 @@ import { spawnSync } from 'node:child_process';
 
 const PROVIDERS = new Set(['openai', 'claude', 'deepseek', 'qwen', 'doubao', 'ollama', 'demo']);
 const validConnectionId=(id:string)=>PROVIDERS.has(id)||/^conn-[a-f0-9-]{36}$/.test(id);
-const validCredentialId=(id:string)=>validConnectionId(id)||(id.startsWith('billing:')&&validConnectionId(id.slice(8)));
+const validInvitationId=(id:string)=>/^invite:[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(id);
+const validCredentialId=(id:string)=>validConnectionId(id)||(id.startsWith('billing:')&&validConnectionId(id.slice(8)))||validInvitationId(id);
 const ENTROPY = 'chat-teahouse-vault-v1';
 // Static script: all variable data is received via stdin, never shell interpolation.
 // stdout is captured in-process only; its contents must never be logged.
@@ -143,4 +144,27 @@ export class SecretVault {
 
   get(providerId: string): string | undefined { return validCredentialId(providerId) ? this.secrets[providerId] : undefined; }
   has(providerId: string): boolean { return this.get(providerId) !== undefined; }
+
+  /** A sealed owner-only invitation can be committed atomically beside its authentication hash. */
+  sealInvitation(id:string,code:string):string {
+    if(!validInvitationId(id)||!/^[A-Za-z0-9_-]{43}$/.test(code))throw new Error('邀请码格式无效。');
+    const iv=randomBytes(12),cipher=createCipheriv('aes-256-gcm',this.master,iv);
+    cipher.setAAD(Buffer.from(ENTROPY+':'+id));
+    const plaintext=Buffer.from(code);
+    try{
+      const ciphertext=Buffer.concat([cipher.update(plaintext),cipher.final()]);
+      return JSON.stringify({version:1,iv:iv.toString('base64'),tag:cipher.getAuthTag().toString('base64'),ciphertext:ciphertext.toString('base64')} satisfies Envelope);
+    }finally{plaintext.fill(0);}
+  }
+  openInvitation(id:string,sealed:string):string {
+    if(!validInvitationId(id)||typeof sealed!=='string'||sealed.length>2048)throw new Error('邀请码密文无效。');
+    try{
+      const envelope:Envelope=JSON.parse(sealed);
+      if(envelope.version!==1||typeof envelope.iv!=='string'||typeof envelope.tag!=='string'||typeof envelope.ciphertext!=='string')throw new Error();
+      const iv=Buffer.from(envelope.iv,'base64'),tag=Buffer.from(envelope.tag,'base64');if(iv.length!==12||tag.length!==16)throw new Error();
+      const decipher=createDecipheriv('aes-256-gcm',this.master,iv);decipher.setAAD(Buffer.from(ENTROPY+':'+id));decipher.setAuthTag(tag);
+      const plaintext=Buffer.concat([decipher.update(Buffer.from(envelope.ciphertext,'base64')),decipher.final()]);
+      try{const code=plaintext.toString('utf8');if(!/^[A-Za-z0-9_-]{43}$/.test(code))throw new Error();return code;}finally{plaintext.fill(0);}
+    }catch{throw new Error('无法解密邀请码，请恢复原主密钥或重置邀请。');}
+  }
 }

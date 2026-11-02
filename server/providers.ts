@@ -41,7 +41,7 @@ function headers(provider: ProviderConfig, apiKey?: string): Record<string, stri
     ? { 'Content-Type': 'application/json', 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' }
     : { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` };
 }
-function cleanError(error: unknown, signal?: AbortSignal, timeoutSeconds = 120): Error {
+function cleanError(error: unknown, signal?: AbortSignal, timeoutSeconds = 240): Error {
   if (signal?.aborted) return new ProviderError(signal.reason?.name === 'TimeoutError' ? `供应商响应超时（${timeoutSeconds} 秒）。请检查后台网络和代理连接；超时不能用于判断模型名称或密钥是否正确。` : '本次生成已停止。');
   if (error instanceof ProviderError || error instanceof ModelCallError) return error;
   const cause = error instanceof Error ? (error.cause as { code?: unknown } | undefined) : undefined;
@@ -149,7 +149,7 @@ async function demo(request: CompletionRequest): Promise<CompletionResult> {
 }
 
 export async function complete(request: CompletionRequest): Promise<CompletionResult> {
-  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(120_000)]);
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(240_000)]);
   try {
     signal.throwIfAborted();
     if (request.provider.id === 'demo') return await demo({ ...request, signal });
@@ -157,7 +157,7 @@ export async function complete(request: CompletionRequest): Promise<CompletionRe
     const model = request.participant.model || request.provider.model;
     if (!model || model.length > 160 || /[\r\n]/.test(model)) return problem('模型名称无效。');
     const maxTokens = request.maxOutputTokens;
-    if (!Number.isSafeInteger(maxTokens) || maxTokens < 64 || maxTokens > 32768) return problem('单次输出限制应在 64～32768 token。');
+    if (!Number.isSafeInteger(maxTokens) || maxTokens < 64) return problem('单次输出限制应为不少于 64 的有效整数。');
     const id = request.provider.id;
     let endpoint = `${base(request.provider)}/chat/completions`;
     let body: Record<string, unknown> = { model, stream: true, max_tokens: maxTokens, messages: [{ role: 'system', content: system }, { role: 'user', content: input }], stream_options: { include_usage: true } };
@@ -175,6 +175,7 @@ export async function complete(request: CompletionRequest): Promise<CompletionRe
     const response = await fetch(endpoint, { method: 'POST', headers: headers(request.provider, request.apiKey), body: JSON.stringify(body), signal, redirect: 'error' });
     if (!response.ok) throw await readProviderFailure(response, request.provider.id);
     let inputTokens: number | undefined, outputTokens: number | undefined, terminal = false, stopReason = '', output = '', content = '';
+    let invalidUsage=false,claudeFinalOutput=false;
     const emit = (delta: StreamDelta) => {
       if (delta.content) { output += delta.content; content += delta.content; }
       if (delta.reasoning) output += delta.reasoning;
@@ -182,6 +183,9 @@ export async function complete(request: CompletionRequest): Promise<CompletionRe
     };
     const usage = (u: any) => {
       if (!u || typeof u !== 'object') return;
+      if(('input_tokens'in u||'prompt_tokens'in u)&&count(u.input_tokens??u.prompt_tokens)===undefined)invalidUsage=true;
+      if(('output_tokens'in u||'completion_tokens'in u)&&count(u.output_tokens??u.completion_tokens)===undefined)invalidUsage=true;
+      if(id==='claude'&&[u.cache_creation_input_tokens,u.cache_read_input_tokens].some(v=>v!==undefined&&count(v)===undefined))invalidUsage=true;
       inputTokens = count(u.input_tokens ?? u.prompt_tokens) ?? inputTokens;
       outputTokens = count(u.output_tokens ?? u.completion_tokens) ?? outputTokens;
       if (id === 'claude' && inputTokens !== undefined) inputTokens += (count(u.cache_creation_input_tokens) ?? 0) + (count(u.cache_read_input_tokens) ?? 0);
@@ -220,7 +224,7 @@ export async function complete(request: CompletionRequest): Promise<CompletionRe
         } else if (event.type === 'content_block_delta') {
           if (event.delta?.type === 'text_delta' && typeof event.delta.text === 'string') emit({ content: event.delta.text });
           if (event.delta?.type === 'thinking_delta' && typeof event.delta.thinking === 'string') emit({ reasoning: event.delta.thinking, reasoningLabel: '模型提供的思考内容 / 摘要' });
-        } else if (event.type === 'message_delta') { usage(event.usage); stopReason = event.delta?.stop_reason ?? stopReason; }
+        } else if (event.type === 'message_delta') { usage(event.usage); claudeFinalOutput=count(event.usage?.output_tokens)!==undefined; stopReason = event.delta?.stop_reason ?? stopReason; }
         else if (event.type === 'message_stop') {
           if (stopReason !== 'end_turn' && stopReason !== 'stop_sequence' && stopReason !== 'refusal') return problem('Claude 回答未正常结束，可能达到输出上限。');
           terminal = true; break;
@@ -241,8 +245,10 @@ export async function complete(request: CompletionRequest): Promise<CompletionRe
     signal.throwIfAborted();
     if (!terminal) return problem('供应商响应连接提前断开，本次回答未完成。');
     if (!content.trim()) return problem('供应商没有返回可显示的正文。');
-    // UTF-8 bytes give a deliberately conservative fallback for mixed languages.
-    return { inputTokens: inputTokens ?? estimateInputTokens(request), outputTokens: outputTokens ?? Math.max(maxTokens, Buffer.byteLength(output)) };
+    // Fallback counters remain useful locally; callers enforcing a hosted budget
+    // must retain the conservative reservation when vendor usage is unavailable.
+    const estimated=invalidUsage||count(inputTokens)===undefined||count(outputTokens)===undefined||(id==='claude'&&!claudeFinalOutput);
+    return { inputTokens: inputTokens ?? estimateInputTokens(request), outputTokens: outputTokens ?? Math.max(maxTokens, Buffer.byteLength(output)),...(estimated?{usageEstimated:true}:{}) };
   } catch (error) { throw cleanError(error, signal); }
 }
 

@@ -15,12 +15,13 @@ export const PEER_GROUP_RULES = `交流场景：这是多人群聊和头脑风�
 export function groupBroadcast(wake: RuntimeWake, delivery: Delivery) {
   return {
     type: 'room-wakeup', audience: 'whole-group', event: 'group-message-broadcast',
+      ...(wake.singleResponse?{singleResponse:true,taskNotice:'你被人类讨论者 @，本次仅处理这一次指定任务，例如总结或扩展观点。阅读公开上下文后用群聊工具提交一次完整回复；完成后自动回到待命，不会开启持续讨论。群聊可能仍处于暂停状态，这不妨碍本次授权回复。若确实无法回答，可以明确等待并说明原因。'}:{}),
     instruction: '读完群友的整组发言，对照自己的已有观点再判断；有依据地赞同、质疑或保留意见，不先恭维。没有新贡献就等待。pendingSpeech 表示有人尚未说完，此时等待即可。speech 同一 id 的消息属于同一次发言，interrupted 表示后半段未发送，不要自行补全。',
     selfId: wake.participant.id,
     goal: wake.group.goal,
     roster: [
       { id: 'human', name: '人类讨论者', kind: 'human', role: 'equal-peer' },
-      ...wake.group.participants.filter(p => p.enabled).map(p => ({ id: p.id, name: p.name, kind: 'ai', model: p.model, provider: p.providerId, role: 'equal-peer', availability: wake.memberStates?.find(m => m.id === p.id)?.status ?? 'unknown' })),
+        ...wake.group.participants.map(p => ({ id: p.id, name: p.name, kind: 'ai', model: p.model, provider: p.providerId, role: 'equal-peer', participation:p.enabled?'automatic':'human-mention-only', availability: wake.memberStates?.find(m => m.id === p.id)?.status ?? 'unknown' })),
     ],
     firstWake: wake.firstWake, ...delivery,
   };

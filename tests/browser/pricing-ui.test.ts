@@ -52,9 +52,37 @@ test('RMB price hints cover every provider, calculate quantities, preserve USD a
   await page.getByRole('checkbox', { name: '启用此连接', exact: true }).click(); await page.getByText('连接已启用并保存', { exact: true }).waitFor();
   // Unknown endpoints have no fabricated quote, but custom prices still support the calculator.
   await page.getByRole('checkbox', { name: '高级：手动填写模型 ID', exact: true }).check();
-  await page.getByLabel('自定义模型 ID', { exact: true }).fill('ep-custom-test');
+  const customModel = page.getByLabel('自定义模型 ID', { exact: true });
+  const savedModels = Object.keys(runtime.store.providers().find(p => p.id === 'doubao')!.modelPrices ?? {});
+  for (const value of ['', 'ep', '', 'ep-custom-test']) {
+    await customModel.fill(value);
+    assert.equal(await customModel.count(), 1, 'editing an empty model must not duplicate the picker');
+    assert.equal(await page.getByRole('combobox', { name: '默认模型', exact: true }).count(), 1);
+    assert.equal(await page.getByLabel('输入单价', { exact: true }).count(), 1);
+    assert.equal(await customModel.evaluate(el => el === document.activeElement), true, 'typing must retain focus');
+  }
+  await page.getByLabel('输入单价', { exact: true }).fill('1.44');
+  await page.getByLabel('输出单价', { exact: true }).fill('7.2');
+  await customModel.fill('');
+  await page.getByRole('button', { name: '保存连接', exact: true }).click();
+  assert.equal(await customModel.evaluate(el => (el as HTMLInputElement).validity.valueMissing), true);
+  assert.equal(runtime.store.providers().find(p => p.id === 'doubao')!.model, 'doubao-seed-2-1-lite-260915');
+  await customModel.pressSequentially('ep-custom-test');
+  assert.equal(await page.getByLabel('输入单价', { exact: true }).inputValue(), '1.44');
+  assert.equal(await page.getByLabel('输出单价', { exact: true }).inputValue(), '7.2');
+  await page.getByRole('button', { name: '保存连接', exact: true }).click();
+  await page.getByText('连接配置已保存', { exact: true }).waitFor();
+  const customSaved = runtime.store.providers().find(p => p.id === 'doubao')!;
+  assert.equal(customSaved.model, 'ep-custom-test');
+  assert.deepEqual(Object.keys(customSaved.modelPrices!).sort(), [...new Set([...savedModels, 'ep-custom-test'])].sort(), 'empty and partially typed IDs must not be saved as model prices');
+  assert.ok(Math.abs(customSaved.inputPrice - 0.2) < 1e-12);
+  assert.equal(customSaved.outputPrice, 1);
   await page.getByRole('button', { name: '输入参考价格说明', exact: true }).hover(); assert.match(await page.getByRole('tooltip').innerText(), /暂无此模型/);
   assert.equal(await page.getByRole('button', { name: '采用此参考单价', exact: true }).count(), 0);
+  await customModel.fill('doubao-seed-2-1-lite-260915');
+  assert.equal(await page.getByLabel('输入单价', { exact: true }).inputValue(), '0.8');
+  await page.getByRole('button', { name: '保存连接', exact: true }).click();
+  await page.getByText('连接配置已保存', { exact: true }).waitFor();
   await page.getByRole('button', { name: '关闭对话框', exact: true }).click();
   await page.getByRole('button', { name: '成员与设置', exact: true }).click();
   await page.getByRole('button', { name: '邀请一位 AI 入座', exact: true }).click();

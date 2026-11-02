@@ -5,8 +5,9 @@ import { ModelCallError, ModelResponseError, readProviderFailure, type ResponseF
 import { estimateTokens } from '../token-estimate.js';
 export { ModelCallError, ProviderRequestError } from '../model-errors.js';
 
-export interface NativeReply { blocks: ContentBlock[]; inputTokens: number; outputTokens: number; replayState?: ReplayEnvelope; returnedReasoning?:ReturnedReasoning; }
-export type NativeGenerate = (options: GenerateOptions, provider: ProviderConfig, apiKey: string | undefined) => Promise<NativeReply>;
+export interface NativeReply { blocks: ContentBlock[]; inputTokens: number; outputTokens: number; usageEstimated?:boolean; replayState?: ReplayEnvelope; returnedReasoning?:ReturnedReasoning; }
+export type NativeGenerateOptions = GenerateOptions & {timeoutMs?:number};
+export type NativeGenerate = (options: NativeGenerateOptions, provider: ProviderConfig, apiKey: string | undefined) => Promise<NativeReply>;
 const textOf = (content: readonly ContentBlock[]) => content.filter(b=>b.type==='text').map(b=>b.text).join('\n');
 const object = (v: unknown): Record<string,any> => {
   if(!v||typeof v!=='object'||Array.isArray(v))throw new ModelCallError('模型返回的数据结构不正确。');return v as Record<string,any>;
@@ -137,12 +138,17 @@ export function parseNativeReply(value: unknown, provider: ProviderConfig, input
     if(provider.id==='doubao')replayState={response:{kind:'teahouse-doubao-v1',items:[{...m,role:'assistant'}]}};
   }
   if(blocks.length>32)throw new ModelCallError('模型单次返回的工具调用或内容块过多。');
-  return {blocks,inputTokens:tokens(input,inputEstimate),outputTokens:tokens(output,outputReserve),...(replayState?{replayState}:{}),...(reasoning?{returnedReasoning:reasoning}:{})};
+  // Preserve local display estimates, but let hosted budgets distinguish them
+  // from an authoritative vendor usage report before releasing reservations.
+  const invalidCache=provider.id==='claude'&&[data.usage?.cache_creation_input_tokens,data.usage?.cache_read_input_tokens].some(v=>v!==undefined&&!Number.isFinite(tokens(v,NaN)));
+  const estimated=invalidCache||!Number.isFinite(tokens(input,NaN))||!Number.isFinite(tokens(output,NaN));
+  return {blocks,inputTokens:tokens(input,inputEstimate),outputTokens:tokens(output,outputReserve),...(estimated?{usageEstimated:true}:{}),...(replayState?{replayState}:{}),...(reasoning?{returnedReasoning:reasoning}:{})};
 }
 
 export const generateNative: NativeGenerate = async(options,provider,apiKey) => {
   const request=nativeRequest(options,provider,apiKey);
-  const signal=AbortSignal.any([...(options.signal?[options.signal]:[]),AbortSignal.timeout(120000)]);
+  const timeoutMs=options.timeoutMs??240000;
+  const signal=AbortSignal.any([...(options.signal?[options.signal]:[]),AbortSignal.timeout(timeoutMs)]);
   try {
     const response=await fetch(request.url,{method:'POST',headers:request.headers,body:JSON.stringify(request.body),signal,redirect:'error'});
     if(!response.ok)throw await readProviderFailure(response,provider.id);
@@ -155,7 +161,7 @@ export const generateNative: NativeGenerate = async(options,provider,apiKey) => 
     return parseNativeReply(JSON.parse(Buffer.concat(chunks).toString('utf8')),provider,inputEstimate,options.maxTokens??1200);
   } catch(error) {
     if(options.signal?.aborted)throw new ModelCallError('本次生成已停止。');
-    if(signal.aborted)throw new ModelCallError('供应商响应超过 120 秒，已暂停该成员。');
+    if(signal.aborted)throw new ModelCallError(`供应商响应超过 ${timeoutMs/1000} 秒，已停止本次请求。`);
     if(error instanceof ModelCallError)throw error;
     throw new ModelCallError('无法完成模型请求。请检查网络和模型配置；原始响应未写入群聊。');
   }

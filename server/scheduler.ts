@@ -1,6 +1,6 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { identityModeOf, WEB_CHAT_URLS, connectionKey, resolveConnection, type CompletionRequest, type CompletionResult, type Group, type Message, type Participant, type PendingWebTurn, type ProviderConfig, type Run, type WebProviderId } from '../shared/types.js';
+import { identityModeOf, WEB_CHAT_URLS, connectionKey, resolveConnection, defaultWorkspaceLimits, type WorkspaceLimits, type CompletionRequest, type CompletionResult, type Group, type Message, type Participant, type PendingWebTurn, type ProviderConfig, type Run, type WebProviderId } from '../shared/types.js';
 import { BrowserConnectorError, type BrowserDriver } from './browser-connector.js';
 import { Store } from './store.js';
 import { buildDiscussionPrompt, estimateInputTokens } from './providers.js';
@@ -11,10 +11,16 @@ export interface SchedulerDeps {
   providers: () => ProviderConfig[]; getKey: (id: string) => string | undefined;
   generate: Generate; notify: (groupId: string) => void;
   browser?: BrowserDriver;
+  resourceLimits?: () => Partial<WorkspaceLimits>;
   wait?: (ms:number, signal:AbortSignal) => Promise<void>; random?: (min:number,max:number) => number;
 }
 export class DiscussionError extends Error { constructor(message:string,public statusCode=400){super(message);} }
 export const isActive = (r: Run) => r.status==='running'||r.status==='waiting'||r.status==='awaiting_web';
+export function activeDiscussionGroups(store:Store):number {
+  const active=new Set(store.freeSessions().filter(session=>session.status==='active').map(session=>session.groupId));
+  for(const group of store.groups())if(store.runs(group.id).some(isActive))active.add(group.id);
+  return active.size;
+}
 
 export class Scheduler {
   private controllers = new Map<string, AbortController>();
@@ -28,7 +34,7 @@ export class Scheduler {
     const group=this.requireGroup(groupId);
     if(group.archived)throw new DiscussionError('请先恢复这个茶桌。');
     if(this.store.runs(groupId).some(isActive))throw new DiscussionError('这张茶桌已有讨论正在进行。',409);
-    if(this.controllers.size>=3)throw new DiscussionError('最多同时运行 3 场讨论，请等待或停止其他茶桌。',429);
+    this.assertCapacity();
     const all=group.participants.filter(p=>p.enabled);
     const participants=all;
     if(!participants.length||options.targetId&&!all.some(p=>p.id===options.targetId))throw new DiscussionError('至少启用一位有效成员后才能开始。');
@@ -57,12 +63,16 @@ export class Scheduler {
     if(group.archived||run.participants.some(p=>!group.participants.some(current=>current.id===p.id&&current.enabled&&current.profileId===p.profileId&&current.profileRevision===p.profileRevision)))throw new DiscussionError('群聊或成员档案已变化，请开始新的讨论；旧发言不能继续重试。',409);
     if(this.store.runs(run.groupId)[0]?.id!==id)throw new DiscussionError('已有更新的讨论，请在新讨论中继续，避免混入旧上下文。',409);
     if(this.controllers.has(id)||this.store.runs(run.groupId).some(isActive))throw new DiscussionError('上一次调用仍在结束，请稍后重试。',409);
-    if(this.controllers.size>=3)throw new DiscussionError('同时运行的讨论已达到上限。',429);
+    this.assertCapacity();
     this.validateProviders(run.targetId?run.participants.filter(p=>p.id===run.targetId):run.summaryOnly?[run.participants.find(p=>p.id===run.settings.summaryParticipantId)??run.participants[0]]:run.participants);
     run.status='running';delete run.error;delete run.finishedAt;
     this.store.saveRun(run);this.launch(run);return run;
   }
   async settle(id:string) {await this.jobs.get(id);}
+  private assertCapacity(){
+    const max=this.deps.resourceLimits?.().maxActiveGroupsPerUser??defaultWorkspaceLimits.maxActiveGroupsPerUser;
+    if(Math.max(this.controllers.size,activeDiscussionGroups(this.store))>=max)throw new DiscussionError(`最多同时运行 ${max} 场讨论，请等待或停止其他茶桌。`,429);
+  }
   startBrowser(id:string,requestId:string):Run {
     const entry=this.requireWebTurn(id,requestId);
     if(entry.participant.channel!=='browser')throw new DiscussionError('此成员未选择浏览器连接。',400);
@@ -144,12 +154,12 @@ export class Scheduler {
   private async turn(run:Run,participant:Participant,summary:boolean,signal:AbortSignal) {
     signal.throwIfAborted();
     if(run.turnCount>=run.settings.maxCalls)throw new DiscussionError('达到本场调用次数上限，已停止后续请求。');
-    if(Date.now()-Date.parse(run.createdAt)>60*60*1000)throw new DiscussionError('本场讨论已达到 60 分钟上限。');
     const seconds=run.turnCount===0?0:run.settings.delayMode==='random'?this.random(Math.round(run.settings.delayMin*1000),Math.round(run.settings.delayMax*1000))/1000:run.settings.delaySeconds;
     run.nextSpeakerId=participant.id;
     if(seconds>0){run.status='waiting';run.nextAt=new Date(Date.now()+seconds*1000).toISOString();this.store.saveRun(run);this.deps.notify(run.groupId);await (this.deps.wait??((ms,s)=>sleep(ms,undefined,{signal:s})))(seconds*1000,signal);}
-    if(Date.now()-Date.parse(run.createdAt)>60*60*1000)throw new DiscussionError('本场讨论已达到 60 分钟上限，等待后没有再启动请求。');
     signal.throwIfAborted();delete run.nextAt;
+    const messageId=`${run.id}:${summary?'summary':`${run.currentRound}:${participant.id}`}`;
+    this.assertMessageCapacity(run.groupId,messageId);
     if(participant.channel==='browser'){await this.browserTurn(run,participant,summary,signal);return;}
     const provider=resolveConnection(this.deps.providers(),participant);
     if(provider?.billingMode==='subscription')throw new DiscussionError('ChatGPT 订阅连接用于自主群聊，请将讨论模式切换为自主群聊。');
@@ -169,7 +179,6 @@ export class Scheduler {
     if(run.settings.budgetUSD>0&&run.estimatedUSD+reserveCost>run.settings.budgetUSD)throw new DiscussionError('预计下一次调用会超过金额预算，已停止后续请求。');
     signal.throwIfAborted();run.status='running';delete run.nextAt;run.turnCount++;this.store.saveRun(run);
     // Stable message identity on retries; failed attempts stay accounted for in run counters.
-    const messageId=`${run.id}:${summary?'summary':`${run.currentRound}:${participant.id}`}`;
     const msg:Message={id:messageId,groupId:run.groupId,runId:run.id,participantId:participant.id,author:participant.name,avatar:participant.avatar,avatarAssetId:participant.avatarAssetId,color:participant.color,
       providerId:participant.providerId,model:participant.model||provider.model,source:'api',kind:summary?'summary':'assistant',content:'',reasoning:'',reasoningLabel:'',
       round:summary?run.chosenRounds+1:run.currentRound,status:'streaming',createdAt:new Date().toISOString(),inputMessageIds:history.map(m=>m.id),inputTokens:0,outputTokens:0};
@@ -196,6 +205,11 @@ export class Scheduler {
       else{run.inputTokens+=msg.inputTokens;run.outputTokens+=msg.outputTokens;run.estimatedUSD+=failedCost;this.store.saveRun(run);}
       flush();throw error;
     }
+  }
+  private assertMessageCapacity(groupId:string,messageId:string){
+    const max=this.deps.resourceLimits?.().maxMessagesPerGroup??defaultWorkspaceLimits.maxMessagesPerGroup;
+    const messages=this.store.messages(groupId);
+    if(messages.length>=max&&!messages.some(message=>message.id===messageId))throw new DiscussionError(`本群已达到 ${max} 条记录上限，请在分享助手中调整限制或新建群聊。`);
   }
   private roster(run:Run):string {
     return JSON.stringify([{name:'我',type:'human',role:'平等讨论成员；观点可以被质疑'},...run.participants.map(p=>({name:p.name,type:'ai',provider:p.providerId,model:p.model,identityMode:identityModeOf(p)}))]);

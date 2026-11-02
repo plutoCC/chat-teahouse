@@ -6,6 +6,7 @@ export interface ProviderConfig {
   connectionId?: string; label?: string;
   region: 'cn' | 'intl'; inputPrice: number; outputPrice: number;
   modelPrices?:Record<string,{inputPrice:number;outputPrice:number}>;
+  sharedModels?:string[];
   billingMode?:'api'|'subscription';
 }
 export const connectionKey = (p: ProviderConfig) => p.connectionId ?? p.id;
@@ -19,7 +20,7 @@ export interface Sticker { id:string; name:string; tags:string[]; assetId:string
 export interface StickerAttachment { id:string; name:string; tags:string[]; assetId:string; }
 export interface Participant { id: string; profileId?: string; profileRevision?: number; connectionId?: string; name: string; providerId: ProviderId; model: string; role: string; avatar: string; avatarAssetId?: string; color: string; enabled: boolean; identityMode?: 'native' | 'role'; channel?: 'api' | 'browser'; skills?: string[]; }
 export type ProfileFields = Omit<Participant, 'id' | 'profileId' | 'profileRevision' | 'enabled'>;
-export interface MemberProfile extends ProfileFields { id: string; revision: number; createdAt: string; updatedAt: string; deletedAt?: string; }
+export interface MemberProfile extends ProfileFields { id: string; revision: number; createdAt: string; updatedAt: string; deletedAt?: string; shared?:{creatorId:string;creatorName:string;canEdit:boolean;unavailableReason?:string;connectionMode?:'api'|'subscription'}; }
 /** Explicit allowlist keeps membership flags and private runtime state out of global identities. */
 export function profileFields(p: ProfileFields): ProfileFields {
   return { name:p.name, providerId:p.providerId, model:p.model, role:p.role, avatar:p.avatar, ...(p.connectionId?{connectionId:p.connectionId}:{}), ...(p.avatarAssetId?{avatarAssetId:p.avatarAssetId}:{}), color:p.color, identityMode:p.identityMode??(p.role.trim()?'role':'native'), channel:p.channel??'api', skills:[...(p.skills??[])] };
@@ -65,14 +66,16 @@ export interface Run {
   pendingWeb?: PendingWebTurn;
 }
 export interface GroupDetail { group: Group; messages: Message[]; runs: Run[]; activeRun: Run | null; freeSession?: FreeSession | null; usage?:RoomUsage; }
-export interface Bootstrap { csrfToken: string; groups: Group[]; profiles?: MemberProfile[]; deletedProfiles?: MemberProfile[]; stickers?: Sticker[]; providers: ProviderConfig[]; skills?: SkillSummary[]; security: { localOnly: boolean; vault: string; version: string }; }
+export interface WorkspaceLimits {maxGroupsPerUser:number;maxMembersPerGroup:number;maxProfilesPerUser:number;maxMessagesPerGroup:number;maxDiscussionRounds:number;maxDiscussionCalls:number;maxDiscussionBudgetUSD:number;maxConcurrentMembers:number;maxCallsPerWake:number;maxSsePerUser:number;maxActiveGroupsPerUser:number;maxActiveMembersPerUser:number;}
+export const defaultWorkspaceLimits:WorkspaceLimits={maxGroupsPerUser:200,maxMembersPerGroup:8,maxProfilesPerUser:2000,maxMessagesPerGroup:5000,maxDiscussionRounds:12,maxDiscussionCalls:128,maxDiscussionBudgetUSD:1000,maxConcurrentMembers:4,maxCallsPerWake:32,maxSsePerUser:12,maxActiveGroupsPerUser:3,maxActiveMembersPerUser:6};
+export interface Bootstrap { csrfToken: string; groups: Group[]; profiles?: MemberProfile[]; deletedProfiles?: MemberProfile[]; stickers?: Sticker[]; providers: ProviderConfig[]; skills?: SkillSummary[]; limits?:WorkspaceLimits; security: { localOnly: boolean; vault: string; version: string; hosted?:boolean; hostingAdmin?:boolean; userName?:string;sharedMembers?:boolean }; }
 export interface StreamDelta { content?: string; reasoning?: string; reasoningLabel?: string; }
 export interface CompletionRequest {
   provider: ProviderConfig; apiKey?: string; participant: Participant; goal: string;
   roster: string; history: Message[]; round: number; summary: boolean; maxOutputTokens: number;
   signal: AbortSignal; onDelta: (delta: StreamDelta) => void;
 }
-export interface CompletionResult { inputTokens: number; outputTokens: number; }
+export interface CompletionResult { inputTokens: number; outputTokens: number; usageEstimated?:boolean; }
 export const defaultSettings: DiscussionSettings = {
   contextMode:'round',order:'fixed',roundsMode:'fixed',rounds:2,roundsMin:2,roundsMax:4,
   delayMode:'fixed',delaySeconds:2,delayMin:1,delayMax:5,maxOutputTokens:1200,

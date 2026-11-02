@@ -31,9 +31,9 @@ function PriceHelp({ label, children }: { label: string; children: ReactNode }) 
   </span>;
 }
 
-export function BudgetField({ valueUSD, change }: { valueUSD: number; change: (usd: number) => void }) {
+export function BudgetField({ valueUSD, change, maxUSD=1000 }: { valueUSD: number; change: (usd: number) => void; maxUSD?:number }) {
   const fx = useExchangeRate(); const id = useId();
-  return <div className="field price-field"><div className="price-label"><label htmlFor={id}>费用预算（人民币）</label><PriceHelp label="费用预算说明"><b>本次讨论的估算总费用上限</b><span>按模型连接中保存的单价估算；输入和输出都计费。填 0 关闭金额保护。</span><span>按 1 美元 ≈ {fx} 元显示，可在模型连接中修改估算汇率；不是实时汇率。</span><span>已有预算的美元金额保持不变。实际费用以供应商账单为准。</span></PriceHelp></div><input id={id} type="number" required min="0" max={1000 * fx} step="any" value={displayNumber(valueUSD * fx)} onChange={e => change(cnyToUsd(Math.max(0, Number(e.target.value)), fx))}/></div>;
+  return <div className="field price-field"><div className="price-label"><label htmlFor={id}>费用预算（人民币）</label><PriceHelp label="费用预算说明"><b>本次讨论的估算总费用上限</b><span>按模型连接中保存的单价估算；输入和输出都计费。填 0 关闭金额保护。</span><span>按 1 美元 ≈ {fx} 元显示，可在模型连接中修改估算汇率；不是实时汇率。</span><span>已有预算的美元金额保持不变。实际费用以供应商账单为准。</span></PriceHelp></div><input id={id} type="number" required min="0" max={maxUSD * fx} step="any" value={displayNumber(valueUSD * fx)} onChange={e => change(cnyToUsd(Math.max(0, Number(e.target.value)), fx))}/></div>;
 }
 
 export function ModelPricing({ provider, inputUSD, outputUSD, change, disabled }: {

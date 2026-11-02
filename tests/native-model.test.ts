@@ -8,6 +8,40 @@ import { ModelResponseError, ProviderRequestError } from '../server/model-errors
 const provider=(id:ProviderId):ProviderConfig=>({id,name:id,enabled:true,hasKey:true,model:'tool-model',region:'cn',inputPrice:1,outputPrice:1});
 const options=():GenerateOptions=>({provider:'openai',model:'tool-model',system:'讨论协议',maxTokens:800,messages:[createUserMessage({content:[{type:'text',text:'一条公开群消息'}],source:{kind:'user'}})],tools:[{name:'post_message',description:'发布观点',parameters:{type:'object',properties:{content:{type:'string'}},required:['content']}}]});
 
+test('native request uses the configured summary timeout and distinguishes it from user cancellation',async t=>{
+  const controller=new AbortController();let timeout:number|undefined;
+  t.mock.method(AbortSignal,'timeout',(ms:number)=>{timeout=ms;return controller.signal;});
+  t.mock.method(globalThis,'fetch',async()=>{controller.abort(new DOMException('fixture','TimeoutError'));throw controller.signal.reason;});
+  await assert.rejects(generateNative({...options(),timeoutMs:600000},provider('openai'),'fixture-key'),/超过 600 秒/);assert.equal(timeout,600000);
+  const user=new AbortController();user.abort();await assert.rejects(generateNative({...options(),timeoutMs:600000,signal:user.signal},provider('openai'),'fixture-key'),/本次生成已停止/);
+});
+
+test('ordinary model requests default to four minutes and report that timeout',async t=>{
+  const controller=new AbortController();let timeout=0;
+  t.mock.method(AbortSignal,'timeout',(ms:number)=>{timeout=ms;return controller.signal;});
+  t.mock.method(globalThis,'fetch',async()=>{controller.abort(new DOMException('fixture','TimeoutError'));throw controller.signal.reason;});
+  await assert.rejects(generateNative(options(),provider('deepseek'),'fixture-key'),/超过 240 秒/);assert.equal(timeout,240000);
+});
+
+test('native replies identify incomplete or invalid usage without replacing existing fallback counters',()=>{
+  for(const id of ['openai','claude','deepseek','qwen','doubao','ollama'] as const){
+    const shape=(usage:unknown)=>id==='openai'?{status:'completed',output:[{type:'message',content:[{type:'output_text',text:'演示观点'}]}],usage}:id==='claude'?{stop_reason:'end_turn',content:[{type:'text',text:'演示观点'}],usage}:{choices:[{finish_reason:'stop',message:{content:'演示观点'}}],usage};
+    const keys=id==='openai'||id==='claude'?['input_tokens','output_tokens']:['prompt_tokens','completion_tokens'];
+    for(const [input,output] of [[12,8],[0,0]]){
+      const result=parseNativeReply(shape({[keys[0]]:input,[keys[1]]:output}),provider(id),700,800);
+      assert.equal(result.usageEstimated,undefined,id);assert.equal(result.inputTokens,input);assert.equal(result.outputTokens,output);
+    }
+    for(const usage of [undefined,{}, {[keys[0]]:12}, {[keys[1]]:8}, {[keys[0]]:-1,[keys[1]]:8}, {[keys[0]]:12,[keys[1]]:'8'}, {[keys[0]]:12,[keys[1]]:NaN}, {[keys[0]]:12,[keys[1]]:0.5}, {[keys[0]]:12,[keys[1]]:1e12}]){
+      const result=parseNativeReply(shape(usage),provider(id),700,800);assert.equal(result.usageEstimated,true,id);assert.ok(result.inputTokens>=0);assert.ok(result.outputTokens>=0);
+    }
+    const missing=parseNativeReply(shape(undefined),provider(id),700,800);assert.equal(missing.inputTokens,700);assert.equal(missing.outputTokens,800);
+  }
+  for(const invalid of [null,'7',-1,NaN,0.5,1e12]){
+    const result=parseNativeReply({stop_reason:'end_turn',content:[],usage:{input_tokens:12,output_tokens:8,cache_read_input_tokens:invalid}},provider('claude'),700,800);
+    assert.equal(result.usageEstimated,true);
+  }
+});
+
 test('truncated reasoning responses retain validated usage and safe diagnostics without exposing partial output',()=>{
   for(const id of ['deepseek','doubao','qwen'] as const) {
     const data={choices:[{finish_reason:'length',message:{reasoning_content:'PRIVATE_THOUGHT',content:'PRIVATE_TEXT',tool_calls:[{id:'partial',function:{name:'post_message',arguments:'{"content":"PARTIAL_TOOL'}}]}}],usage:{prompt_tokens:201,completion_tokens:1200}};

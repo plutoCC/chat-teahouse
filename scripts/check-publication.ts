@@ -2,9 +2,9 @@ import {execFileSync} from 'node:child_process';
 import {resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
-const rootFiles=new Set(['.gitignore','.gitattributes','.editorconfig','.env.example','LICENSE','README.md','CHANGELOG.md','CONTRIBUTING.md','SECURITY.md','THIRD_PARTY_NOTICES.md','package.json','package-lock.json','tsconfig.json','vite.config.ts','index.html','Start-Teahouse.cmd','Start-Teahouse.ps1','Launch-Teahouse.cmd','Stop-Teahouse.cmd']);
+const rootFiles=new Set(['.gitignore','.gitattributes','.editorconfig','.env.example','LICENSE','README.md','CHANGELOG.md','CONTRIBUTING.md','SECURITY.md','THIRD_PARTY_NOTICES.md','package.json','package-lock.json','tsconfig.json','vite.config.ts','index.html','Start-Teahouse.cmd','Start-Teahouse.ps1','Launch-Teahouse.cmd','Stop-Teahouse.cmd','Share-Teahouse.cmd']);
 const screenshots=new Set(['docs/images/demo.png','docs/images/demo-mentions.png']);
-const docs=new Set(['docs/DEPLOYMENT.md','docs/USER-GUIDE.md','docs/ARCHITECTURE.md','docs/TESTING.md',...screenshots]);
+const docs=new Set(['docs/DEPLOYMENT.md','docs/HOSTING.md','docs/USER-GUIDE.md','docs/ARCHITECTURE.md','docs/TESTING.md',...screenshots]);
 export interface Finding {path:string;line?:number;reason:string;}
 export function inspectPublicFile(path:string,bytes:Buffer,mode='100644'):Finding[] {
   const findings:Finding[]=[],add=(reason:string,line?:number)=>findings.push({path,line,reason});

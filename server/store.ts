@@ -185,7 +185,8 @@ export class Store {
     this.atomic(() => {
       for(const row of this.db.prepare("SELECT id FROM free_calls WHERE status='reserved'").all())this.settleCall(String(row.id));
       for(const session of this.freeSessions()) {
-        if(session.status!=='active'){if(session.sending){delete session.sending;this.saveFreeSession(session);}continue;}
+        const wasPausing=!!session.pauseRequested||session.members.some(m=>m.manualWake);delete session.pauseRequested;for(const m of session.members)if(m.manualWake){delete m.manualWake;m.status='paused';delete m.wakeAt;m.activity='上次单次唤醒已停止，未自动重试';}
+        if(session.status!=='active'){if(session.sending||wasPausing){delete session.sending;this.saveFreeSession(session);}continue;}
         delete session.sending;
         session.status='interrupted';session.epoch++;session.error='后台已重启。已保留消息、已读位置和预算；点击继续后恢复，未自动重发在途请求。';
         for(const member of session.members) { member.status='paused';delete member.wakeAt; }

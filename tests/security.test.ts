@@ -113,10 +113,12 @@ test('security headers survive hijacked SSE and development middleware responses
   }
 });
 
-test('discussion controls enforce finite limits and ordered random ranges', () => {
+test('discussion schemas enforce finite safety bounds and ordered ranges; product limits are workspace policy', () => {
   assert.equal(settingsSchema.safeParse(defaultSettings).success, true);
+  for(const maxOutputTokens of [8193,32769,65536,1048576])assert.equal(settingsSchema.safeParse({...defaultSettings,maxOutputTokens,maxTotalTokens:100000000}).success,true);
   assert.equal(settingsSchema.safeParse({ ...defaultSettings, budgetUSD: 0, delaySeconds: 0 }).success, true);
-  for (const change of [{ rounds: 0 }, { rounds: 13 }, { roundsMin: 5, roundsMax: 2 }, { delayMin: 20, delayMax: 10 }, { delaySeconds: -1 }, { delaySeconds: 301 }, { delaySeconds: Infinity }, { maxCalls: 129 }, { maxCalls: 1.5 }, { maxOutputTokens: 8193 }, { maxTotalTokens: 999 }, { maxTotalTokens: 1_000_001 }, { budgetUSD: -1 }, { budgetUSD: NaN }, { budgetUSD: 1001 }]) {
+  assert.equal(settingsSchema.safeParse({...defaultSettings,rounds:13,maxCalls:129,budgetUSD:1001}).success,true);
+  for (const change of [{ rounds: 0 }, { rounds: 10001 }, { roundsMin: 5, roundsMax: 2 }, { delayMin: 20, delayMax: 10 }, { delaySeconds: -1 }, { delaySeconds: 301 }, { delaySeconds: Infinity }, { maxCalls: 1000001 }, { maxCalls: 1.5 }, { maxOutputTokens: 127 }, { maxOutputTokens: Infinity }, { maxOutputTokens: 8193.5 }, { maxOutputTokens: Number.MAX_SAFE_INTEGER + 1 }, { maxTotalTokens: 999 }, { maxTotalTokens: NaN }, { maxTotalTokens: Infinity }, { maxTotalTokens: 1000.5 }, { maxTotalTokens: Number.MAX_SAFE_INTEGER + 1 }, { budgetUSD: -1 }, { budgetUSD: NaN }, { budgetUSD: 10000001 }]) {
     assert.equal(settingsSchema.safeParse({ ...defaultSettings, ...change }).success, false, JSON.stringify(change));
   }
 });
@@ -146,7 +148,8 @@ test('participant display values and provider fields cannot introduce URLs or ar
     assert.equal(participantSchema.safeParse({ ...participant, ...change }).success, false);
   }
   assert.equal(patchGroupSchema.safeParse({ participants: [participant, participant] }).success, false);
-  assert.equal(patchGroupSchema.safeParse({ participants: Array.from({ length: 9 }, (_, i) => ({ ...participant, id: `p${i}` })) }).success, false);
+  assert.equal(patchGroupSchema.safeParse({ participants: Array.from({ length: 9 }, (_, i) => ({ ...participant, id: `p${i}` })) }).success, true);
+  assert.equal(patchGroupSchema.safeParse({ participants: Array.from({ length: 101 }, (_, i) => ({ ...participant, id: `p${i}` })) }).success, false);
   assert.equal(providerUpdateSchema.safeParse({ apiKey: null }).success, true);
   assert.equal(providerUpdateSchema.safeParse({ apiKey: '' }).success, false);
   assert.equal(providerUpdateSchema.safeParse({ apiKey: 'x'.repeat(4097) }).success, false);

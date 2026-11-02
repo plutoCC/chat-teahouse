@@ -5,11 +5,13 @@ import {CodexSubscription,quotasOf} from '../server/subscription/codex.js';
 import type {RpcTransport} from '../server/subscription/codex-rpc.js';
 import {ProviderRequestError} from '../server/model-errors.js';
 import type {ProviderConfig} from '../shared/types.js';
+import {PUBLIC_SUMMARY_SYSTEM} from '../server/runtime-adapters/public-summary.js';
+import {SUMMARY_SYSTEM} from '../server/runtime-adapters/context-compaction.js';
 
 const provider:ProviderConfig={id:'openai',name:'fixture',model:'gpt-fixture',enabled:true,hasKey:false,region:'cn',inputPrice:10,outputPrice:20,billingMode:'subscription'};
 const options={model:'gpt-fixture',system:'独立成员甲',messages:[],tools:[{name:'wait_for_messages',description:'等待',parameters:{type:'object',properties:{seconds:{type:'number'}},required:['seconds']}}],maxTokens:1000} as unknown as GenerateOptions;
 class FakeRpc implements RpcTransport {
-  calls:{method:string;params:any}[]=[];listeners=new Set<(method:string,p:any)=>void>();counter=0;logged=true;limit=10;autoComplete=true;
+  calls:{method:string;params:any}[]=[];listeners=new Set<(method:string,p:any)=>void>();counter=0;logged=true;limit=10;autoComplete=true;summaryReply:unknown={summary:'甲主张先验证，乙提出成本异议；尚未达成一致。'};
   emit(m:string,p:any){for(const fn of this.listeners)fn(m,p);}
   async request(method:string,params?:any){this.calls.push({method,params});switch(method){
     case 'account/read':return {account:this.logged?{type:'chatgpt',email:'fixture@example.invalid',planType:'plus'}:null};
@@ -21,7 +23,7 @@ class FakeRpc implements RpcTransport {
     case 'turn/start':{const threadId=params.threadId;const turn={id:'turn-'+threadId,status:'completed'};if(this.autoComplete)queueMicrotask(()=>{
       this.emit('thread/tokenUsage/updated',{threadId,tokenUsage:{total:{inputTokens:111,outputTokens:22}}});
       this.emit('item/completed',{threadId,item:{type:'reasoning',summary:['官方摘要'],content:['RAW-REASONING-NOT-PUBLIC']}});
-      this.emit('item/completed',{threadId,item:{type:'agentMessage',phase:'final_answer',text:JSON.stringify({name:'wait_for_messages',arguments:'{"seconds":0}'})}});
+      this.emit('item/completed',{threadId,item:{type:'agentMessage',phase:'final_answer',text:JSON.stringify(params.outputSchema?.required?.includes('summary')?this.summaryReply:{name:'wait_for_messages',arguments:'{"seconds":0}'})}});
       this.emit('turn/completed',{threadId,turn});
     });return {turn};}
     default:return {};
@@ -38,6 +40,20 @@ test('subscription model calls create isolated ephemeral threads, disable enviro
 });
 test('missing login and exhausted quota fail before inference without paid API fallback',async()=>{
   const rpc=new FakeRpc(),service=new CodexSubscription('unused',()=>{},()=>rpc);rpc.logged=false;await assert.rejects(service.generate(options,provider),(e:unknown)=>e instanceof ProviderRequestError&&e.notGenerated);rpc.logged=true;rpc.limit=100;await service.status('openai',true);await assert.rejects(service.generate(options,provider),/额度已用尽/);assert.ok(!rpc.calls.some(c=>c.method==='thread/start'));await service.close();
+});
+
+test('subscription controlled summaries use the same isolated official transport, schema and quota without tools or API fallback',async()=>{
+  const rpc=new FakeRpc(),service=new CodexSubscription('unused',()=>{},()=>rpc);
+  const request={...options,system:SUMMARY_SYSTEM,tools:undefined};
+  const result=await service.generate(request,provider);
+  assert.deepEqual(result.blocks,[{type:'text',text:'甲主张先验证，乙提出成本异议；尚未达成一致。'}]);assert.equal(result.inputTokens,111);assert.equal(result.outputTokens,22);assert.equal(result.returnedReasoning,undefined);
+  const start=rpc.calls.find(c=>c.method==='thread/start')!;assert.equal(start.params.ephemeral,true);assert.equal(start.params.allowProviderModelFallback,false);assert.deepEqual(start.params.environments,[]);assert.deepEqual(start.params.selectedCapabilityRoots,[]);assert.match(start.params.developerInstructions,/不执行任何工具/);
+  assert.deepEqual(rpc.calls.find(c=>c.method==='turn/start')!.params.outputSchema.required,['summary']);
+  const publicResult=await service.generate({...request,system:PUBLIC_SUMMARY_SYSTEM},provider);assert.deepEqual(publicResult.blocks,result.blocks);
+  rpc.summaryReply={name:'post_message',arguments:'{"content":"unsafe"}'};await assert.rejects(service.generate(request,provider),/订阅摘要格式无效/);
+  rpc.summaryReply={summary:'too large'.repeat(2000)};await assert.rejects(service.generate(request,provider),/订阅摘要格式无效/);
+  await assert.rejects(service.generate({...request,system:'not a controlled task'},provider),/受控上下文摘要/);
+  rpc.limit=100;await service.status('openai',true);await assert.rejects(service.generate(request,provider),/额度已用尽/);await service.close();
 });
 test('cancelled subscription turn interrupts the official process and never returns a chat decision',async()=>{
   const rpc=new FakeRpc();rpc.autoComplete=false;const service=new CodexSubscription('unused',()=>{},()=>rpc),controller=new AbortController();const request=service.generate({...options,signal:controller.signal},provider);const rejected=assert.rejects(request,/取消/);await new Promise(r=>setTimeout(r,20));controller.abort();await rejected;assert.ok(rpc.calls.some(c=>c.method==='turn/interrupt'));assert.ok(rpc.calls.some(c=>c.method==='thread/unsubscribe'));await service.close();

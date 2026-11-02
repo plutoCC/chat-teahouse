@@ -17,7 +17,7 @@ const waitUntil=async(fn:()=>boolean)=>{const end=Date.now()+7000;while(!fn()){a
 test('default group template saves edited settings atomically and persists without copying seats or changing other rooms',async t=>{
   const f=await fixture(t),source=f.runtime.store.groups()[0],other=(await f.request('POST','/api/groups',{name:'已有其他群',goal:'已有议题',profileIds:[]})).json(),unchanged=JSON.stringify(other);
   const path=`/api/groups/${source.id}/default-template`;
-  const template={conversationMode:'round',settings:{...source.settings,rounds:5,budgetUSD:0.8,maxOutputTokens:6000,summaryParticipantId:source.participants[0].id},freeSettings:{...source.freeSettings!,readingCharsPerSecond:20,messageGapMin:2,messageGapMax:6,wakeProbability:0.7,concurrency:3}};
+  const template={conversationMode:'round',settings:{...source.settings,rounds:5,budgetUSD:0.8,maxOutputTokens:65536,maxTotalTokens:100000000,summaryParticipantId:source.participants[0].id},freeSettings:{...source.freeSettings!,readingCharsPerSecond:20,messageGapMin:2,messageGapMax:6,wakeProbability:0.7,concurrency:3}};
   const saved=await f.request('POST',path,template);assert.equal(saved.statusCode,200,saved.body);const defaults=saved.json();assert.equal(defaults.settings.summaryParticipantId,'');
   assert.equal(f.runtime.store.group(source.id)!.settings.summaryParticipantId,source.participants[0].id);assert.equal(f.runtime.store.group(source.id)!.freeSettings!.readingCharsPerSecond,20);
   assert.equal(JSON.stringify(f.runtime.store.group(other.id)),unchanged);
@@ -63,9 +63,9 @@ async function fixture(t:TestContext){
   return {get runtime(){return runtime;},request,wakes,catalogs,path:d.path,async restart(){await runtime.app.close();runtime=await buildApp(options);await auth();}};
 }
 
-test('mentions validate active room membership, preserve selected duplicate names and avoid partial-name matching',async t=>{
+test('mentions validate room membership and allow standby seats only in free mode, preserve selected duplicate names and avoid partial-name matching',async t=>{
   const f=await fixture(t),group=f.runtime.store.groups()[0];
-  group.participants[0].name='甲';group.participants[1].name='甲乙';group.participants[2].name='甲';group.participants[2].enabled=true;f.runtime.store.saveGroup(group);
+  group.conversationMode='round';group.participants[0].name='甲';group.participants[1].name='甲乙';group.participants[2].name='甲';group.participants[2].enabled=true;f.runtime.store.saveGroup(group);
   assert.equal(containsMention('@甲乙 回应','甲'),false);assert.equal(containsMention('邮箱a@甲','甲'),false);assert.equal(containsMention('@成员 甲，请说','成员 甲'),true);
   assert.deepEqual(inferredMentions('@甲 回应',group.participants),[]);assert.deepEqual(inferredMentions('@甲乙 回应',group.participants),[group.participants[1].id]);
   const url=`/api/groups/${group.id}/messages`;
@@ -73,6 +73,9 @@ test('mentions validate active room membership, preserve selected duplicate name
   for(const payload of [{content:'没有点名',mentions:[group.participants[0].id]},{content:'@甲 点名',mentions:['outside-room']}])assert.equal((await f.request('POST',url,payload)).statusCode,400);
   group.participants[0].enabled=false;f.runtime.store.saveGroup(group);assert.equal((await f.request('POST',url,{content:'@甲 点名',mentions:[group.participants[0].id]})).statusCode,400);
   assert.equal(f.wakes.length,0);assert.equal((await f.request('GET',`/api/groups/${group.id}/logs`)).statusCode,200);assert.equal((await f.request('GET',`/api/groups/${group.id}/usage`)).json().members.length,0);
+  group.conversationMode='free';f.runtime.store.saveGroup(group);
+  assert.equal((await f.request('POST',url,{content:'@甲 点名',mentions:[group.participants[0].id]})).statusCode,201);
+  await waitUntil(()=>f.wakes.length===1);await f.runtime.roomEngine.settle(group.id);assert.equal(f.wakes[0].singleResponse,true);assert.equal(f.runtime.store.freeSession(group.id)!.status,'paused');
 });
 
 test('local journal keeps the newest 500 entries independently per group and caps returned text',async t=>{
@@ -162,7 +165,7 @@ test('restart retains only already emitted bubbles and clears interrupted speech
   const d=dir();let store=new Store(d.path);try{
     const group=store.createGroup('崩溃恢复','仅本地数据');
     const message:Message={id:'emitted',groupId:group.id,participantId:group.participants[0].id,author:'测试成员',avatar:'测',color:'#000000',kind:'assistant',content:'已发送的第一段',reasoning:'',reasoningLabel:'',round:0,status:'complete',createdAt:new Date().toISOString(),inputMessageIds:[],inputTokens:0,outputTokens:0,speech:{id:'speech-id',index:1,total:3,state:'sending'}};
-    store.publish('original-tool',message);store.saveFreeSession({id:'session',groupId:group.id,status:'active',epoch:1,createdAt:message.createdAt,updatedAt:message.createdAt,deadline:Date.now()+60000,callCount:1,publishedCount:1,inputTokens:20,outputTokens:30,reservedTokens:0,estimatedUSD:0,reservedUSD:0,uncertainCalls:0,members:[],sending:{memberId:group.participants[0].id,speechId:'speech-id',sent:1,total:3}});
-    store.close();store=new Store(d.path);store.recoverFreeSessions();assert.equal(store.messages(group.id).length,1);assert.equal(store.messages(group.id)[0].speech!.state,'interrupted');assert.equal(store.freeSession(group.id)!.sending,undefined);assert.equal(store.freeSession(group.id)!.status,'interrupted');assert.equal(store.events(group.id).length,1);assert.equal(store.existingPost('original-tool')!.id,'emitted');
+    store.publish('original-tool',message);store.saveFreeSession({id:'session',groupId:group.id,status:'active',epoch:1,createdAt:message.createdAt,updatedAt:message.createdAt,deadline:Date.now()+60000,callCount:1,publishedCount:1,inputTokens:20,outputTokens:30,reservedTokens:0,estimatedUSD:0,reservedUSD:0,uncertainCalls:0,members:[],pauseRequested:{memberId:group.participants[0].id},sending:{memberId:group.participants[0].id,speechId:'speech-id',sent:1,total:3}});
+    store.close();store=new Store(d.path);store.recoverFreeSessions();assert.equal(store.messages(group.id).length,1);assert.equal(store.messages(group.id)[0].speech!.state,'interrupted');assert.equal(store.freeSession(group.id)!.sending,undefined);assert.equal(store.freeSession(group.id)!.status,'interrupted');assert.equal(store.freeSession(group.id)!.pauseRequested,undefined);assert.equal(store.events(group.id).length,1);assert.equal(store.existingPost('original-tool')!.id,'emitted');
   }finally{store.close();d.clean();}
 });
